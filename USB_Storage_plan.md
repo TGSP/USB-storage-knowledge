@@ -181,7 +181,8 @@ host应尝试将**dCBWDataTransferLength**和*Direction*位指定的确切字节
 ###### 1.2.2.4.3 Status Transport
 device应通过**Bulk-In**端点发送CSW到host。
 
-**Status Transport Flow：**
+**Status Transport Flow：**  
+
 ![GitHub set up](images/status_Transport_Flow.png)
 ###### 1.2.2.4.4 Reset Recovery
 对于**Reset Recovery**，host应遵循如下顺序：
