@@ -1,2 +1,19 @@
-# tgsp-information
-my personal information about knowledge for linux.
+# USB storage
+
+## 1.综述
+- 从USB storage相应手册介绍规范内容；
+- 从USB内核源码部分介绍USB storage代码流程逻辑；
+
+## 2.目标
+- 争取做到对USB storage部分有个全面的认识；
+- 忽略对部分硬件私有代码实现的理解，能做到对通用U盘驱动做到熟悉即可；
+
+## 3.周期
+- 争取工作外业余时间，周末闲暇时候尽量完成本学习进度；
+- 当前规划为2018年第一季度时长；
+
+## 4.口号
+```
+答案总是容易的，
+      答对太难！
+```
