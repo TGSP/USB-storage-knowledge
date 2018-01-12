@@ -653,6 +653,7 @@ static const struct scsi_host_template usb_stor_host_template = {
 	.module =			THIS_MODULE
 };
 
+/* 初始化struct scsi_host_template结构体实例 */
 void usb_stor_host_template_init(struct scsi_host_template *sht,
 				 const char *name, struct module *owner)
 {

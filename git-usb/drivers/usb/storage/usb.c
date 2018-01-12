@@ -63,7 +63,7 @@
 #include "uas-detect.h"
 #endif
 
-#define DRV_NAME "usb-storage"
+#define DRV_NAME "usb-storage" /* 驱动名称 */
 
 /* Some informational data */
 MODULE_AUTHOR("Matthew Dharm <mdharm-usb@one-eyed-alien.net>");
@@ -1089,6 +1089,7 @@ void usb_stor_disconnect(struct usb_interface *intf)
 }
 EXPORT_SYMBOL_GPL(usb_stor_disconnect);
 
+/* struct scsi_host_template结构体实例usb_stor_host_template */
 static struct scsi_host_template usb_stor_host_template;
 
 /* The main probe routine for standard devices */
@@ -1101,7 +1102,7 @@ static int storage_probe(struct usb_interface *intf,
 	int size;
 
 	/* If uas is enabled and this device can do uas then ignore it. */
-#if IS_ENABLED(CONFIG_USB_UAS)
+#if IS_ENABLED(CONFIG_USB_UAS) /* uas: usb attached scsi protocol */
 	if (uas_use_uas_driver(intf, id, NULL))
 		return -ENXIO;
 #endif
@@ -1156,4 +1157,5 @@ static struct usb_driver usb_storage_driver = {
 	.soft_unbind =	1,
 };
 
+/* USB storage入口函数 */
 module_usb_stor_driver(usb_storage_driver, usb_stor_host_template, DRV_NAME);

@@ -49,7 +49,7 @@ struct usb_device_id usb_storage_usb_ids[] = {
 };
 MODULE_DEVICE_TABLE(usb, usb_storage_usb_ids);
 
-#undef UNUSUAL_DEV
+#undef UNUSUAL_DEV /* 注销宏定义 */
 #undef COMPLIANT_DEV
 #undef USUAL_DEV
 #undef UNUSUAL_VENDOR_INTF
