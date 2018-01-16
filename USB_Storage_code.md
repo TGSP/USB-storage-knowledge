@@ -288,9 +288,9 @@ static int storage_probe(struct usb_interface *intf,
 &ensp;&ensp;&ensp;&ensp;其中变量unusual_dev不常用device列表结构体的实例，struct us_unusual_dev结构体定义如下，在probe函数中用于排查不常用device之用：
 
 ```C
-/*      
+/*
  * Unusual device list definitions 
- */  
+ */
 struct us_unusual_dev {
     const char* vendorName;
     const char* productName;
@@ -453,5 +453,670 @@ static struct us_unusual_dev for_dynamic_ids =
    - 将.useTransport赋值为USB_PR_BULK。
 
 ### 2.5 usb_stor_probe1()函数解析
+&ensp;&ensp;&ensp;&ensp;函数实现如下，稍后各小节再逐条进行分析：
+```C
+/* First part of general USB mass-storage probing */
+int usb_stor_probe1(struct us_data **pus,
+        struct usb_interface *intf,
+        const struct usb_device_id *id,
+        struct us_unusual_dev *unusual_dev,
+        struct scsi_host_template *sht)
+{
+    struct Scsi_Host *host;
+    struct us_data *us;
+    int result;
 
+    dev_info(&intf->dev, "USB Mass Storage device detected\n");
+
+    /*
+     * Ask the SCSI layer to allocate a host structure, with extra
+     * space at the end for our private us_data structure.
+     */
+    host = scsi_host_alloc(sht, sizeof(*us));
+    if (!host) {
+        dev_warn(&intf->dev, "Unable to allocate the scsi host\n");
+        return -ENOMEM;
+    }
+    
+    /*
+     * Allow 16-byte CDBs and thus > 2TB
+     */
+    host->max_cmd_len = 16;
+    host->sg_tablesize = usb_stor_sg_tablesize(intf);
+    *pus = us = host_to_us(host);
+    mutex_init(&(us->dev_mutex));
+    us_set_lock_class(&us->dev_mutex, intf);
+    init_completion(&us->cmnd_ready);
+    init_completion(&(us->notify));
+    init_waitqueue_head(&us->delay_wait);
+    INIT_DELAYED_WORK(&us->scan_dwork, usb_stor_scan_dwork);
+
+    /* Associate the us_data structure with the USB device */
+    result = associate_dev(us, intf);
+    if (result)
+        goto BadDevice;
+
+    /* Get the unusual_devs entries and the descriptors */
+    result = get_device_info(us, id, unusual_dev);
+    if (result)
+        goto BadDevice;
+
+    /* Get standard transport and protocol settings */
+    get_transport(us);
+    get_protocol(us);
+
+    /*
+     * Give the caller a chance to fill in specialized transport
+     * or protocol settings.
+     */
+    return 0;
+
+BadDevice:
+    usb_stor_dbg(us, "storage_probe() failed\n");
+    release_everything(us);
+    return result;
+}
+EXPORT_SYMBOL_GPL(usb_stor_probe1);
+```
+#### 2.5.1 变量分析
+&ensp;&ensp;&ensp;&ensp;该函数开头定义了三个变量：
+```C
+    struct Scsi_Host *host;
+    struct us_data *us;
+    int result;
+```
+&ensp;&ensp;&ensp;&ensp;struct Scsi_Host结构体实例host，此处简单分析一下struct scsi_host_template和struct Scsi_Host结构体的关系，在Linux中，每一个scsi主机控制器对应一个数据结构，Scsi_Host（而Linux中将通过使用一个scsi_host_template结构指针为参数的函数来为Scsi_Host初始化，scsi_host_template实现控制器的操作函数以及命令封装，两个结构体包含了很多相同的元素，但又不完全相同，他们协同工作，互相关联，但是各自起的作用不一样，且Scsi_Host有且仅有一个struct scsi_host_template），但有些Scsi_Host对应的并非是真实的scsi卡，虽然硬件是并不存在，但仍然需要一个Scsi_Host，如U盘，因为她被模拟成SCSI设备，所以得为她准备一个SCSI卡，这个可以在插入U盘后，通过cat /proc/scsi/scsi的输出来了解：
+```C
+$ cat /proc/scsi/scsi
+Attached devices:
+Host: scsi1 Channel: 00 Id: 00 Lun: 00
+  Vendor: ATA      Model: WDC WD10JPVX-22J Rev: 1A01
+  Type:   Direct-Access                    ANSI  SCSI revision: 05
+Host: scsi3 Channel: 00 Id: 00 Lun: 00
+  Vendor: TSSTcorp Model: CDDVDW SH-224DB  Rev: CM00
+  Type:   CD-ROM                           ANSI  SCSI revision: 05
+Host: scsi4 Channel: 00 Id: 00 Lun: 00
+  Vendor: Netac    Model: OnlyDisk         Rev: 1.0 
+  Type:   Direct-Access                    ANSI  SCSI revision: 02
+```
+&ensp;&ensp;&ensp;&ensp;当前在/proc/scsi目录下还会因为插入U盘后，动态的生成usb-storage目录，里面即是每个新插入的U盘的一些信息，如当前插入的U盘，显示为4，其内信息如下:
+```C
+$ cat /proc/scsi/usb-storage/4 
+   Host scsi4: usb-storage
+       Vendor: Netac
+      Product: OnlyDisk
+Serial Number: 43A02D3FDE34408D
+     Protocol: Transparent SCSI
+    Transport: Bulk
+       Quirks:
+```
+&ensp;&ensp;&ensp;&ensp;struct us_data已经介绍，一个usb storage驱动实现的结构体，非常的重要。int result作为函数结构检查；
+#### 2.5.2 host初始化
+&ensp;&ensp;&ensp;&ensp;通过将&usb_stor_host_template作为参数传给scsi_host_alloc()函数，分配一个struct Scsi_Host结构体实例，以及相应内存等，此处将us也作为参数传入，是在host的unsigned long hostdata[0]元素中分配了struct us_data结构体内存，作为其私有数据以供后续使用。（此处不继续深究scsi_host_alloc()实现）
+```C
+    /*
+     * Ask the SCSI layer to allocate a host structure, with extra
+     * space at the end for our private us_data structure.
+     */
+    host = scsi_host_alloc(sht, sizeof(*us));
+    if (!host) {
+        dev_warn(&intf->dev, "Unable to allocate the scsi host\n");
+        return -ENOMEM;
+    }
+```
+#### 2.5.3 host填充及us部分初始化
+```C
+    /*
+     * Allow 16-byte CDBs and thus > 2TB
+     */
+    host->max_cmd_len = 16;
+    host->sg_tablesize = usb_stor_sg_tablesize(intf);
+    *pus = us = host_to_us(host);
+    mutex_init(&(us->dev_mutex));
+    us_set_lock_class(&us->dev_mutex, intf);
+    init_completion(&us->cmnd_ready);
+    init_completion(&(us->notify));
+    init_waitqueue_head(&us->delay_wait);
+    INIT_DELAYED_WORK(&us->scan_dwork, usb_stor_scan_dwork);
+```
+&ensp;&ensp;&ensp;&ensp;定义host的元素max_cmd_len为16，以及sg_tablesize大小，通过intf对应的usb设备所在的总线支持的sg_tablesize大小：
+```C
+static unsigned int usb_stor_sg_tablesize(struct usb_interface *intf)
+{
+    struct usb_device *usb_dev = interface_to_usbdev(intf);
+
+    if (usb_dev->bus->sg_tablesize) {
+        return usb_dev->bus->sg_tablesize;
+    }
+    return SG_ALL;
+}
+```
+&ensp;&ensp;&ensp;&ensp;将函数传入的struct us_data二级指针参数pus与本函数内定义的us和host相关联：
+```C
+    *pus = us = host_to_us(host);
+```
+&ensp;&ensp;&ensp;&ensp;接下来则是各类锁，信号量，等待队列，延迟工作队列的初始化：
+```C
+    mutex_init(&(us->dev_mutex));
+    us_set_lock_class(&us->dev_mutex, intf);
+    init_completion(&us->cmnd_ready);
+    init_completion(&(us->notify));
+    init_waitqueue_head(&us->delay_wait);
+    INIT_DELAYED_WORK(&us->scan_dwork, usb_stor_scan_dwork);
+```
+&ensp;&ensp;&ensp;&ensp;此处需要注意的是us->cmnd_ready和us->notify，其在scsi cmd和abort传递上实现了内核同步机制。此处初始化了一个延迟工作队列，稍后在调用的地方再讲解这个实现额函数：usb_stor_scan_dwork()。
+#### 2.5.4 associate_dev()实现
+```C
+    /* Associate the us_data structure with the USB device */
+    result = associate_dev(us, intf);
+    if (result)
+        goto BadDevice;
+```
+&ensp;&ensp;&ensp;&ensp;正如注释所说，是将USB device和us变量联结起来，代码实现如下：
+```C
+/* Associate our private data with the USB device */
+static int associate_dev(struct us_data *us, struct usb_interface *intf)
+{
+    /* Fill in the device-related fields */
+    us->pusb_dev = interface_to_usbdev(intf);
+    us->pusb_intf = intf;
+    us->ifnum = intf->cur_altsetting->desc.bInterfaceNumber;
+    usb_stor_dbg(us, "Vendor: 0x%04x, Product: 0x%04x, Revision: 0x%04x\n",
+             le16_to_cpu(us->pusb_dev->descriptor.idVendor),
+             le16_to_cpu(us->pusb_dev->descriptor.idProduct),
+             le16_to_cpu(us->pusb_dev->descriptor.bcdDevice));
+    usb_stor_dbg(us, "Interface Subclass: 0x%02x, Protocol: 0x%02x\n",
+             intf->cur_altsetting->desc.bInterfaceSubClass,
+             intf->cur_altsetting->desc.bInterfaceProtocol);
+    
+    /* Store our private data in the interface */
+    usb_set_intfdata(intf, us);
+        
+    /* Allocate the control/setup and DMA-mapped buffers */
+    us->cr = kmalloc(sizeof(*us->cr), GFP_KERNEL);
+    if (!us->cr)
+        return -ENOMEM;
+
+    us->iobuf = usb_alloc_coherent(us->pusb_dev, US_IOBUF_SIZE,
+            GFP_KERNEL, &us->iobuf_dma);
+    if (!us->iobuf) {
+        usb_stor_dbg(us, "I/O buffer allocation failed\n");
+        return -ENOMEM;
+    }
+    return 0;
+}
+```
+&ensp;&ensp;&ensp;&ensp;这其中做了以下几件事：
+- 将us->pusb_dev与intf对应的USB device联结；
+- 将us->pusb_intf与intf联结；
+- 将us->ifnum赋值为intf对应的当前设置接口下的描述符bInterfaceNumber；
+- 将us作为intf私有数据：usb_set_intfdata(intf, us)；
+- 分配us下的控制传输buffer：
+```C
+    /* Allocate the control/setup and DMA-mapped buffers */
+    us->cr = kmalloc(sizeof(*us->cr), GFP_KERNEL);
+    if (!us->cr)
+        return -ENOMEM;
+```
+- 分配I/O buffer的DMA内存，大小为64byte；
+
+#### 2.5.5 get_device_info()实现
+```C
+    /* Get the unusual_devs entries and the descriptors */
+    result = get_device_info(us, id, unusual_dev);
+    if (result)
+        goto BadDevice;
+```
+&ensp;&ensp;&ensp;&ensp;get_device_info()实现如下，用于获取USB device的硬件信息：
+```C
+/* Get the unusual_devs entries and the string descriptors */
+static int get_device_info(struct us_data *us, const struct usb_device_id *id,
+        struct us_unusual_dev *unusual_dev)
+{
+    struct usb_device *dev = us->pusb_dev;
+    struct usb_interface_descriptor *idesc =
+        &us->pusb_intf->cur_altsetting->desc;
+    struct device *pdev = &us->pusb_intf->dev;
+
+    /* Store the entries */
+    us->unusual_dev = unusual_dev;
+    us->subclass = (unusual_dev->useProtocol == USB_SC_DEVICE) ?
+            idesc->bInterfaceSubClass :
+            unusual_dev->useProtocol;
+    us->protocol = (unusual_dev->useTransport == USB_PR_DEVICE) ?
+            idesc->bInterfaceProtocol :
+            unusual_dev->useTransport;
+    us->fflags = id->driver_info;
+    usb_stor_adjust_quirks(us->pusb_dev, &us->fflags);
+
+    if (us->fflags & US_FL_IGNORE_DEVICE) {
+        dev_info(pdev, "device ignored\n");
+        return -ENODEV;
+    }
+
+    /*
+     * This flag is only needed when we're in high-speed, so let's
+     * disable it if we're in full-speed
+     */
+    if (dev->speed != USB_SPEED_HIGH)
+        us->fflags &= ~US_FL_GO_SLOW;
+
+    if (us->fflags)
+        dev_info(pdev, "Quirks match for vid %04x pid %04x: %lx\n",
+                le16_to_cpu(dev->descriptor.idVendor),
+                le16_to_cpu(dev->descriptor.idProduct),
+                us->fflags);
+
+    /*
+     * Log a message if a non-generic unusual_dev entry contains an
+     * unnecessary subclass or protocol override.  This may stimulate
+     * reports from users that will help us remove unneeded entries
+     * from the unusual_devs.h table.
+     */
+    if (id->idVendor || id->idProduct) {
+        static const char *msgs[3] = {
+            "an unneeded SubClass entry",
+            "an unneeded Protocol entry",
+            "unneeded SubClass and Protocol entries"};
+        struct usb_device_descriptor *ddesc = &dev->descriptor;
+        int msg = -1;
+
+        if (unusual_dev->useProtocol != USB_SC_DEVICE &&
+            us->subclass == idesc->bInterfaceSubClass)
+            msg += 1;
+        if (unusual_dev->useTransport != USB_PR_DEVICE &&
+            us->protocol == idesc->bInterfaceProtocol)
+            msg += 2;
+        if (msg >= 0 && !(us->fflags & US_FL_NEED_OVERRIDE))
+            dev_notice(pdev, "This device "
+                    "(%04x,%04x,%04x S %02x P %02x)"
+                    " has %s in unusual_devs.h (kernel"
+                    " %s)\n"
+                    "   Please send a copy of this message to "
+                    "<linux-usb@vger.kernel.org> and "
+                    "<usb-storage@lists.one-eyed-alien.net>\n",
+                    le16_to_cpu(ddesc->idVendor),
+                    le16_to_cpu(ddesc->idProduct),
+                    le16_to_cpu(ddesc->bcdDevice),
+                    idesc->bInterfaceSubClass,
+                    idesc->bInterfaceProtocol,
+                    msgs[msg],
+                    utsname()->release);
+    }
+
+    return 0;
+}
+```
+&ensp;&ensp;&ensp;&ensp;该函数做了以下处理：
+- 关联us->unusual_dev和unusual_dev；
+- 填充us->subclass、us->protocol、us->fflags，这些信息都和unusual_devs.h有关，其中fflags为某些特定功能标记，算得上对设备做限制定制了，举例如下：
+```C
+/*
+ * Nick Bowler <nbowler@elliptictech.com>
+ * SCSI stack spams (otherwise harmless) error messages.
+ */
+UNUSUAL_DEV(  0xc251, 0x4003, 0x0100, 0x0100,
+        "Keil Software, Inc.",
+        "V2M MotherBoard",
+        USB_SC_DEVICE, USB_PR_DEVICE, NULL,
+        US_FL_NOT_LOCKABLE),
+USUAL_DEV(USB_SC_SCSI, USB_PR_BULK),
+```
+&ensp;&ensp;&ensp;&ensp;这其中，当为unusual_dev时，则unusual_dev->useProtocol == USB_SC_DEVICE，所以us->subclass就等于了idesc->bInterfaceSubClass，而当为通用存储设备时，则us->subclass等于了unusual_dev->useProtocol，同理us->protocol也一样，而us->fflags对应的即是US_FL_NOT_LOCKABLE，这宏定义在include/linux/usb_usual.h中，：
+```C
+#define US_DO_ALL_FLAGS                     \
+    US_FLAG(SINGLE_LUN, 0x00000001)         \
+        /* allow access to only LUN 0 */        \
+    US_FLAG(NEED_OVERRIDE,  0x00000002)         \
+        /* unusual_devs entry is necessary */       \
+    US_FLAG(SCM_MULT_TARG,  0x00000004)         \
+        /* supports multiple targets */         \
+    US_FLAG(FIX_INQUIRY,    0x00000008)         \
+        /* INQUIRY response needs faking */     \
+    US_FLAG(FIX_CAPACITY,   0x00000010)         \
+        /* READ CAPACITY response too big */        \
+    US_FLAG(IGNORE_RESIDUE, 0x00000020)         \
+        /* reported residue is wrong */         \
+    US_FLAG(BULK32,     0x00000040)         \
+        /* Uses 32-byte CBW length */           \
+    US_FLAG(NOT_LOCKABLE,   0x00000080)         \
+        /* PREVENT/ALLOW not supported */       \
+    US_FLAG(GO_SLOW,    0x00000100)         \
+        /* Need delay after Command phase */        \
+    US_FLAG(NO_WP_DETECT,   0x00000200)         \
+        /* Don't check for write-protect */     \
+    US_FLAG(MAX_SECTORS_64, 0x00000400)         \
+        /* Sets max_sectors to 64    */         \
+    US_FLAG(IGNORE_DEVICE,  0x00000800)         \
+        /* Don't claim device */            \
+    US_FLAG(CAPACITY_HEURISTICS,    0x00001000)     \
+        /* sometimes sizes is too big */        \
+    US_FLAG(MAX_SECTORS_MIN,0x00002000)         \
+        /* Sets max_sectors to arch min */      \
+    US_FLAG(BULK_IGNORE_TAG,0x00004000)         \
+        /* Ignore tag mismatch in bulk operations */    \
+    US_FLAG(SANE_SENSE,     0x00008000)         \
+        /* Sane Sense (> 18 bytes) */           \
+    US_FLAG(CAPACITY_OK,    0x00010000)         \
+        /* READ CAPACITY response is correct */     \
+    US_FLAG(BAD_SENSE,  0x00020000)         \
+        /* Bad Sense (never more than 18 bytes) */  \
+    US_FLAG(NO_READ_DISC_INFO,  0x00040000)     \
+        /* cannot handle READ_DISC_INFO */      \
+    US_FLAG(NO_READ_CAPACITY_16,    0x00080000)     \
+        /* cannot handle READ_CAPACITY_16 */        \
+    US_FLAG(INITIAL_READ10, 0x00100000)         \
+        /* Initial READ(10) (and others) must be retried */ \
+    US_FLAG(WRITE_CACHE,    0x00200000)         \
+        /* Write Cache status is not available */   \
+    US_FLAG(NEEDS_CAP16,    0x00400000)         \
+        /* cannot handle READ_CAPACITY_10 */        \
+    US_FLAG(IGNORE_UAS, 0x00800000)         \
+        /* Device advertises UAS but it is broken */    \
+    US_FLAG(BROKEN_FUA, 0x01000000)         \
+        /* Cannot handle FUA in WRITE or READ CDBs */   \
+    US_FLAG(NO_ATA_1X,  0x02000000)         \
+        /* Cannot handle ATA_12 or ATA_16 CDBs */   \
+    US_FLAG(NO_REPORT_OPCODES,  0x04000000)     \
+        /* Cannot handle MI_REPORT_SUPPORTED_OPERATION_CODES */ \
+    US_FLAG(MAX_SECTORS_240,    0x08000000)     \
+        /* Sets max_sectors to 240 */           \
+    US_FLAG(NO_REPORT_LUNS, 0x10000000)         \
+        /* Cannot handle REPORT_LUNS */         \
+    US_FLAG(ALWAYS_SYNC, 0x20000000)            \
+        /* lies about caching, so always sync */    \
+
+#define US_FLAG(name, value)    US_FL_##name = value ,
+enum { US_DO_ALL_FLAGS };
+#undef US_FLAG
+```
+##### 2.5.5.1 usb_stor_adjust_quirks()解析
+&ensp;&ensp;&ensp;&ensp;该函数的功能是向内核申请了一个/sys接口，路径是/sys/module/usb_storage/parameters/quirks，用户可以通过实时动态的对某些USB mass storage device添加限制标记。先看代码实现，再介绍如何添加特定设备限定标记。
+###### 2.5.5.1.1 代码实现
+&ensp;&ensp;&ensp;&ensp;代码实现下：
+```C
+/* Works only for digits and letters, but small and fast */
+#define TOLOWER(x) ((x) | 0x20)
+
+/* Adjust device flags based on the "quirks=" module parameter */
+void usb_stor_adjust_quirks(struct usb_device *udev, unsigned long *fflags)
+{
+    char *p;
+    u16 vid = le16_to_cpu(udev->descriptor.idVendor);
+    u16 pid = le16_to_cpu(udev->descriptor.idProduct);
+    unsigned f = 0;
+    unsigned int mask = (US_FL_SANE_SENSE | US_FL_BAD_SENSE |
+            US_FL_FIX_CAPACITY | US_FL_IGNORE_UAS |
+            US_FL_CAPACITY_HEURISTICS | US_FL_IGNORE_DEVICE |
+            US_FL_NOT_LOCKABLE | US_FL_MAX_SECTORS_64 |
+            US_FL_CAPACITY_OK | US_FL_IGNORE_RESIDUE |
+            US_FL_SINGLE_LUN | US_FL_NO_WP_DETECT |
+            US_FL_NO_READ_DISC_INFO | US_FL_NO_READ_CAPACITY_16 |
+            US_FL_INITIAL_READ10 | US_FL_WRITE_CACHE |
+            US_FL_NO_ATA_1X | US_FL_NO_REPORT_OPCODES |
+            US_FL_MAX_SECTORS_240 | US_FL_NO_REPORT_LUNS |
+            US_FL_ALWAYS_SYNC);
+
+    p = quirks;
+    while (*p) {
+        /* Each entry consists of VID:PID:flags */
+        if (vid == simple_strtoul(p, &p, 16) &&
+                *p == ':' &&
+                pid == simple_strtoul(p+1, &p, 16) &&
+                *p == ':')
+            break;
+    
+        /* Move forward to the next entry */
+        while (*p) {
+            if (*p++ == ',')
+                break;
+        }
+    }
+    if (!*p)    /* No match */
+        return;
+
+    /* Collect the flags */
+    while (*++p && *p != ',') {
+        switch (TOLOWER(*p)) {
+        case 'a':
+            f |= US_FL_SANE_SENSE;
+            break;
+        case 'b':
+            f |= US_FL_BAD_SENSE;
+            break;
+        case 'c':
+            f |= US_FL_FIX_CAPACITY;
+            break;
+        case 'd':
+            f |= US_FL_NO_READ_DISC_INFO;
+            break;
+        case 'e':
+            f |= US_FL_NO_READ_CAPACITY_16;
+            break;
+        case 'f':
+            f |= US_FL_NO_REPORT_OPCODES;
+            break;
+        case 'g':
+            f |= US_FL_MAX_SECTORS_240;
+            break;
+        case 'h':
+            f |= US_FL_CAPACITY_HEURISTICS;
+            break;
+        case 'i':
+            f |= US_FL_IGNORE_DEVICE;
+            break;
+        case 'j':
+            f |= US_FL_NO_REPORT_LUNS;
+            break;
+        case 'l':
+            f |= US_FL_NOT_LOCKABLE;
+            break;
+        case 'm':
+            f |= US_FL_MAX_SECTORS_64;
+            break;
+        case 'n':
+            f |= US_FL_INITIAL_READ10;
+            break;
+        case 'o':
+            f |= US_FL_CAPACITY_OK;
+            break;
+        case 'p':
+            f |= US_FL_WRITE_CACHE;
+            break;
+        case 'r':
+            f |= US_FL_IGNORE_RESIDUE;
+            break;
+        case 's':
+            f |= US_FL_SINGLE_LUN;
+            break;
+        case 't':
+            f |= US_FL_NO_ATA_1X;
+            break;
+        case 'u':
+            f |= US_FL_IGNORE_UAS;
+            break;
+        case 'w':
+            f |= US_FL_NO_WP_DETECT;
+            break;
+        case 'y':
+            f |= US_FL_ALWAYS_SYNC;
+            break;
+        /* Ignore unrecognized flag characters */
+        }
+    }
+    *fflags = (*fflags & ~mask) | f;
+}
+EXPORT_SYMBOL_GPL(usb_stor_adjust_quirks);
+```
+&ensp;&ensp;&ensp;&ensp;这部分代码实现的流程如下：
+- 通过udev->descriptor.idVendor和udev->descriptor.idProduct取得当前匹配上的USB device的vid和pid；
+- 通过p = quirks获取/sys接口下quirks接口内数据，内核中quirks变量定义在drivers/usb/storage/usb.c（即本代码的最前面），其是向sys文件系统申请/sys/module/usb_storage/parameters/quirks接口:
+```C
+static char quirks[128];
+module_param_string(quirks, quirks, sizeof(quirks), S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(quirks, "supplemental list of device IDs and their quirks");
+```
+- 第一个while()循环逐一解析quirks文件内字符串，按顺序匹配当前USB device的vid和pid，若匹配上，则退出循环；若当次循环没匹配上，则在第二个while()循环处继续跳过‘,’字符，进入下一次循环继续匹配vid和pid；
+- 当USB device匹配上quirks接口内的vid和pid后，就可以进入第三个while()循环了，该循环通过前期已商定的协议，用户按协议输入对应的字符，以表示对应的宏定义，如‘a’代表US_FL_SANE_SENSE，‘i’代表US_FL_IGNORE_DEVICE等，可以使用多个标记；
+- 最后，将获取到的f标记与mask掩码及fflags一起得到最终的fflags；
+
+###### 2.5.5.1.2 USB storage quirks接口操作
+&ensp;&ensp;&ensp;&ensp;下面以US_FL_IGNORE_DEVICE标记简单介绍一下如何操作quirks接口：
+- 优先获取到需要忽略的USB mass storage device的vid和pid，如下，得到两个U盘的vid和pid分别为0930:6545和058f:6387；
+```C
+# lsusb
+Bus 001 Device 015: ID 0930:6545 Toshiba Corp. Kingston DataTraveler 102/2.0 / HEMA Flash Drive 2 GB / PNY Attache 4GB Stick
+Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+Bus 003 Device 002: ID 0d8c:0105 C-Media Electronics, Inc. CM108 Audio Controller
+Bus 003 Device 001: ID 1d6b:0001 Linux Foundation 1.1 root hub
+Bus 002 Device 010: ID 058f:6387 Alcor Micro Corp. Flash Drive
+Bus 002 Device 001: ID 1d6b:0001 Linux Foundation 1.1 root hub
+Bus 005 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
+Bus 004 Device 003: ID 046d:c077 Logitech, Inc. M105 Optical Mouse
+Bus 004 Device 002: ID 04f3:0103 Elan Microelectronics Corp. ActiveJet K-2024 Multimedia Keyboard
+Bus 004 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+```
+- 将连个U盘的vid和pid以及US_FL_IGNORE_DEVICE标记的代号‘i’按如下规则写入/sys/module/usb_storage/parameters/quirks接口文件中；
+```C
+~# echo "058f:6387:i,0930:6545:i" > /sys/module/usb_storage/parameters/quirks
+~# cat /sys/module/usb_storage/parameters/quirks
+058f:6387:i,0930:6545:i
+
+```
+- 当前已配置成功，则接下来再插入两个U盘中的随便哪个，都会无法驱动，dmesg大致如下,-19对应内核错误码为-ENODEV：
+```C
+[97564.445606] usb 2-1: new full-speed USB device number 11 using ohci-pci
+[97564.660644] usb 2-1: not running at top speed; connect to a high speed hub
+[97564.676651] usb 2-1: New USB device found, idVendor=058f, idProduct=6387
+[97564.676659] usb 2-1: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+[97564.676663] usb 2-1: Product: Mass Storage
+[97564.676668] usb 2-1: Manufacturer: Generic
+[97564.676672] usb 2-1: SerialNumber: 0A0067B7
+[97564.676681] device: '2-1': device_add
+[97564.676751] bus: 'usb': add device 2-1
+[97564.677410] bus: 'usb': driver_probe_device: matched device 2-1 with driver usb
+[97564.677416] bus: 'usb': really_probe: probing driver usb with device 2-1
+[97564.677427] devices_kset: Moving 2-1 to end of list
+[97564.678649] device: '2-1:1.0': device_add
+[97564.678683] bus: 'usb': add device 2-1:1.0
+[97564.678744] bus: 'usb': driver_probe_device: matched device 2-1:1.0 with driver usb-storage
+[97564.678748] bus: 'usb': really_probe: probing driver usb-storage with device 2-1:1.0
+[97564.678757] devices_kset: Moving 2-1:1.0 to end of list
+[97564.678768] usb-storage 2-1:1.0: USB Mass Storage device detected
+[97564.678876] usb-storage 2-1:1.0: device ignored
+[97564.678931] usb-storage: probe of 2-1:1.0 rejects match -19
+[97564.679008] device: 'ep_01': device_add
+[97564.679033] device: 'ep_82': device_add
+[97564.679073] driver: 'usb': driver_bound: bound to device '2-1'
+[97564.679081] bus: 'usb': really_probe: bound device 2-1 to driver usb
+[97564.679094] device: 'ep_00': device_add
+```
+##### 2.5.5.2 get_device_info()判断部分代码
+&ensp;&ensp;&ensp;&ensp;get_device_info()剩下部分代码主要是对udev和unusual_dev做判断：
+- 检查US_FL_IGNORE_DEVICE标记位，若设置了该位，则返回-ENODEV，即-19；
+```C
+    if (us->fflags & US_FL_IGNORE_DEVICE) {
+        dev_info(pdev, "device ignored\n");
+        return -ENODEV;
+    }
+```
+- 检查是否需要设置US_FL_GO_SLOW标志，如代码解释：
+```C
+    /*
+     * This flag is only needed when we're in high-speed, so let's
+     * disable it if we're in full-speed
+     */
+    if (dev->speed != USB_SPEED_HIGH)
+        us->fflags &= ~US_FL_GO_SLOW;
+```
+- 打印输出vid、pid以及fflags标志值：
+```C
+    if (us->fflags)
+        dev_info(pdev, "Quirks match for vid %04x pid %04x: %lx\n",
+                le16_to_cpu(dev->descriptor.idVendor),
+                le16_to_cpu(dev->descriptor.idProduct),
+                us->fflags);
+```
+- 用于判断当前匹配的非通用device若使用了通用的us->subclass或us->protocol时，则需要修改对应的unusual_devs.h文件；
+
+&ensp;&ensp;&ensp;&ensp;至此，get_device_info()函数分析完成。
+#### 2.5.6 get_transport()及get_protocol()函数介绍
+```C
+    /* Get standard transport and protocol settings */
+    get_transport(us);
+    get_protocol(us);
+```
+&ensp;&ensp;&ensp;&ensp;先简单介绍下这两个函数，后续在USB storage内核线程的地方再详细介绍；
+##### 2.5.6.1 get_transport()函数一览
+&ensp;&ensp;&ensp;&ensp;该函数为us->transport及us->transport_reset填充了处理句柄：
+```C
+/* Get the transport settings */
+static void get_transport(struct us_data *us)
+{
+    switch (us->protocol) {
+    case USB_PR_CB:
+        us->transport_name = "Control/Bulk";
+        us->transport = usb_stor_CB_transport;
+        us->transport_reset = usb_stor_CB_reset;
+        us->max_lun = 7;
+        break;
+
+    case USB_PR_CBI:
+        us->transport_name = "Control/Bulk/Interrupt";
+        us->transport = usb_stor_CB_transport;
+        us->transport_reset = usb_stor_CB_reset;
+        us->max_lun = 7;
+        break;
+    
+    case USB_PR_BULK:  /* USB mass storage调用 */
+        us->transport_name = "Bulk";
+        us->transport = usb_stor_Bulk_transport;
+        us->transport_reset = usb_stor_Bulk_reset;
+        break;
+    }
+}
+```
+##### 2.5.6.2 get_protocol()函数一览
+&ensp;&ensp;&ensp;&ensp;该函数为us->proto_handler填充了处理句柄：
+```C
+/* Get the protocol settings */
+static void get_protocol(struct us_data *us)
+{
+    switch (us->subclass) {
+    case USB_SC_RBC:
+        us->protocol_name = "Reduced Block Commands (RBC)";
+        us->proto_handler = usb_stor_transparent_scsi_command;
+        break;
+    
+    case USB_SC_8020:
+        us->protocol_name = "8020i";
+        us->proto_handler = usb_stor_pad12_command;
+        us->max_lun = 0;
+        break;
+
+    case USB_SC_QIC:
+        us->protocol_name = "QIC-157";
+        us->proto_handler = usb_stor_pad12_command;
+        us->max_lun = 0;
+        break;
+    
+    case USB_SC_8070:
+        us->protocol_name = "8070i";
+        us->proto_handler = usb_stor_pad12_command;
+        us->max_lun = 0;
+        break; 
+
+    case USB_SC_SCSI:  /* USB mass storage遵循scsi传输协议 */
+        us->protocol_name = "Transparent SCSI";
+        us->proto_handler = usb_stor_transparent_scsi_command;
+        break;
+
+    case USB_SC_UFI:
+        us->protocol_name = "Uniform Floppy Interface (UFI)";
+        us->proto_handler = usb_stor_ufi_command;
+        break;
+    }
+}
+```
+&ensp;&ensp;&ensp;&ensp;至此usb_stor_probe1()函数介绍完全，返回其上级调用函数。
 

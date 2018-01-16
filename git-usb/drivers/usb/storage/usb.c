@@ -680,7 +680,7 @@ static void get_transport(struct us_data *us)
 		us->max_lun = 7;
 		break;
 
-	case USB_PR_BULK:
+	case USB_PR_BULK:  /* USB mass storage调用 */
 		us->transport_name = "Bulk";
 		us->transport = usb_stor_Bulk_transport;
 		us->transport_reset = usb_stor_Bulk_reset;
@@ -715,7 +715,7 @@ static void get_protocol(struct us_data *us)
 		us->max_lun = 0;
 		break;
 
-	case USB_SC_SCSI:
+	case USB_SC_SCSI:  /* USB mass storage遵循scsi传输协议 */
 		us->protocol_name = "Transparent SCSI";
 		us->proto_handler = usb_stor_transparent_scsi_command;
 		break;
