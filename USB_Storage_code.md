@@ -518,7 +518,7 @@ BadDevice:
 }
 EXPORT_SYMBOL_GPL(usb_stor_probe1);
 ```
-#### 2.5.1 变量分析
+#### 2.5.1 Scsi_Host结构体变量分析
 &ensp;&ensp;&ensp;&ensp;该函数开头定义了三个变量：
 ```C
     struct Scsi_Host *host;
@@ -550,6 +550,8 @@ Serial Number: 43A02D3FDE34408D
     Transport: Bulk
        Quirks:
 ```
+
+---
 &ensp;&ensp;&ensp;&ensp;struct us_data已经介绍，一个usb storage驱动实现的结构体，非常的重要。int result作为函数结构检查；
 #### 2.5.2 host初始化
 &ensp;&ensp;&ensp;&ensp;通过将&usb_stor_host_template作为参数传给scsi_host_alloc()函数，分配一个struct Scsi_Host结构体实例，以及相应内存等，此处将us也作为参数传入，是在host的unsigned long hostdata[0]元素中分配了struct us_data结构体内存，作为其私有数据以供后续使用。（此处不继续深究scsi_host_alloc()实现）
@@ -604,7 +606,7 @@ static unsigned int usb_stor_sg_tablesize(struct usb_interface *intf)
     init_waitqueue_head(&us->delay_wait);
     INIT_DELAYED_WORK(&us->scan_dwork, usb_stor_scan_dwork);
 ```
-&ensp;&ensp;&ensp;&ensp;此处需要注意的是us->cmnd_ready和us->notify，其在scsi cmd和abort传递上实现了内核同步机制。此处初始化了一个延迟工作队列，稍后在调用的地方再讲解这个实现额函数：usb_stor_scan_dwork()。
+&ensp;&ensp;&ensp;&ensp;此处需要注意的是us->cmnd_ready和us->notify，其在scsi cmd和abort传递上实现了内核同步机制。此处初始化了一个延迟工作delay_work，稍后在调用的地方再讲解这个实现的函数：usb_stor_scan_dwork()。
 #### 2.5.4 associate_dev()实现
 ```C
     /* Associate the us_data structure with the USB device */
@@ -1120,3 +1122,861 @@ static void get_protocol(struct us_data *us)
 ```
 &ensp;&ensp;&ensp;&ensp;至此usb_stor_probe1()函数介绍完全，返回其上级调用函数。
 
+### 2.6 usb_stor_probe2()函数解析
+```C
+    /* No special transport or protocol settings in the main module */
+    result = usb_stor_probe2(us);
+```
+&ensp;&ensp;&ensp;&ensp;函数实现如下，其后各节开始逐步解析该函数实现：
+```C
+/* Second part of general USB mass-storage probing */
+int usb_stor_probe2(struct us_data *us)
+{
+    int result;
+    struct device *dev = &us->pusb_intf->dev;
+
+    /* Make sure the transport and protocol have both been set */
+    if (!us->transport || !us->proto_handler) {
+        result = -ENXIO;
+        goto BadDevice;
+    }
+    usb_stor_dbg(us, "Transport: %s\n", us->transport_name);
+    usb_stor_dbg(us, "Protocol: %s\n", us->protocol_name);
+
+    if (us->fflags & US_FL_SCM_MULT_TARG) {
+        /* 
+         * SCM eUSCSI bridge devices can have different numbers
+         * of LUNs on different targets; allow all to be probed.
+         */ 
+        us->max_lun = 7;
+        /* The eUSCSI itself has ID 7, so avoid scanning that */
+        us_to_host(us)->this_id = 7;
+        /* max_id is 8 initially, so no need to set it here */
+    } else {
+        /* In the normal case there is only a single target */
+        us_to_host(us)->max_id = 1;
+        /*
+         * Like Windows, we won't store the LUN bits in CDB[1] for 
+         * SCSI-2 devices using the Bulk-Only transport (even though
+         * this violates the SCSI spec).
+         */
+        if (us->transport == usb_stor_Bulk_transport)
+            us_to_host(us)->no_scsi2_lun_in_cdb = 1;
+    }
+
+    /* fix for single-lun devices */
+    if (us->fflags & US_FL_SINGLE_LUN)
+        us->max_lun = 0;
+
+    /* Find the endpoints and calculate pipe values */
+    result = get_pipes(us);
+    if (result)
+        goto BadDevice;
+
+    /*
+     * If the device returns invalid data for the first READ(10)
+     * command, indicate the command should be retried.
+     */
+    if (us->fflags & US_FL_INITIAL_READ10)
+        set_bit(US_FLIDX_REDO_READ10, &us->dflags);
+
+    /* Acquire all the other resources and add the host */
+    result = usb_stor_acquire_resources(us);
+    if (result)
+        goto BadDevice;
+    usb_autopm_get_interface_no_resume(us->pusb_intf);
+    snprintf(us->scsi_name, sizeof(us->scsi_name), "usb-storage %s",
+                    dev_name(&us->pusb_intf->dev));
+    result = scsi_add_host(us_to_host(us), dev);
+    if (result) {
+        dev_warn(dev,
+                "Unable to add the scsi host\n");
+        goto HostAddErr;
+    }
+
+    /* Submit the delayed_work for SCSI-device scanning */
+    set_bit(US_FLIDX_SCAN_PENDING, &us->dflags);
+
+    if (delay_use > 0)
+        dev_dbg(dev, "waiting for device to settle before scanning\n");
+    queue_delayed_work(system_freezable_wq, &us->scan_dwork,
+            delay_use * HZ);
+    return 0;
+
+    /* We come here if there are any problems */
+HostAddErr:
+    usb_autopm_put_interface_no_suspend(us->pusb_intf);
+BadDevice:
+    usb_stor_dbg(us, "storage_probe() failed\n");
+    release_everything(us);
+    return result;
+}
+EXPORT_SYMBOL_GPL(usb_stor_probe2);
+```
+
+#### 2.6.1  变量解析
+&ensp;&ensp;&ensp;&ensp;该函数只声明了两个变量，result为结果收集，dev为接口device；
+#### 2.6.2 代码检验部分解析
+```C
+    /* Make sure the transport and protocol have both been set */
+    if (!us->transport || !us->proto_handler) {
+        result = -ENXIO;
+        goto BadDevice;
+    }
+    usb_stor_dbg(us, "Transport: %s\n", us->transport_name);
+    usb_stor_dbg(us, "Protocol: %s\n", us->protocol_name);
+
+    if (us->fflags & US_FL_SCM_MULT_TARG) {
+        /*
+         * SCM eUSCSI bridge devices can have different numbers
+         * of LUNs on different targets; allow all to be probed.
+         */
+        us->max_lun = 7;
+        /* The eUSCSI itself has ID 7, so avoid scanning that */
+        us_to_host(us)->this_id = 7;
+        /* max_id is 8 initially, so no need to set it here */
+    } else {
+        /* In the normal case there is only a single target */
+        us_to_host(us)->max_id = 1;
+        /*
+         * Like Windows, we won't store the LUN bits in CDB[1] for
+         * SCSI-2 devices using the Bulk-Only transport (even though
+         * this violates the SCSI spec).
+         */
+        if (us->transport == usb_stor_Bulk_transport)
+            us_to_host(us)->no_scsi2_lun_in_cdb = 1;
+    }
+
+    /* fix for single-lun devices */
+    if (us->fflags & US_FL_SINGLE_LUN)
+        us->max_lun = 0;
+```
+&ensp;&ensp;&ensp;&ensp;此部分做了以下几件事：
+
+- 检查us->transport和us->proto_handler是否被赋值，这个在2.5节usb_stor_probe1()函数中的get_transport(us)和get_protocol(us)已经被赋值了；
+- 添加调试打印，输出Transport:和Protocol:的结果；
+- 根据us->fflags设置us->max_lun的值，像通用的U盘max_lun的值是0；
+- 以及其它一些相关的设置，主要是设置scsi host主机控制器的；
+- 还有对US_FL_INITIAL_READ10标记的设置；
+
+#### 2.6.3 get_pipes()函数分析
+```C
+    /* Find the endpoints and calculate pipe values */
+    result = get_pipes(us);
+    if (result)
+        goto BadDevice;
+```
+&ensp;&ensp;&ensp;&ensp;找到USB mass storage device所在接口上的的端点，并依此计算出pipe值；代码实现如下，以下各小节对其中各部分进行细致分析：
+```C
+/* Get the pipe settings */
+static int get_pipes(struct us_data *us)
+{
+    struct usb_host_interface *alt = us->pusb_intf->cur_altsetting;
+    struct usb_endpoint_descriptor *ep_in;
+    struct usb_endpoint_descriptor *ep_out;
+    struct usb_endpoint_descriptor *ep_int;
+    int res;
+
+    /*
+     * Find the first endpoint of each type we need.
+     * We are expecting a minimum of 2 endpoints - in and out (bulk).
+     * An optional interrupt-in is OK (necessary for CBI protocol).
+     * We will ignore any others.
+     */
+    res = usb_find_common_endpoints(alt, &ep_in, &ep_out, NULL, NULL);
+    if (res) {
+        usb_stor_dbg(us, "bulk endpoints not found\n");
+        return res;
+    }
+
+    res = usb_find_int_in_endpoint(alt, &ep_int);
+    if (res && us->protocol == USB_PR_CBI) {
+        usb_stor_dbg(us, "interrupt endpoint not found\n");
+        return res;
+    }
+
+    /* Calculate and store the pipe values */
+    us->send_ctrl_pipe = usb_sndctrlpipe(us->pusb_dev, 0);
+    us->recv_ctrl_pipe = usb_rcvctrlpipe(us->pusb_dev, 0);
+    us->send_bulk_pipe = usb_sndbulkpipe(us->pusb_dev,
+        usb_endpoint_num(ep_out));
+    us->recv_bulk_pipe = usb_rcvbulkpipe(us->pusb_dev,
+        usb_endpoint_num(ep_in));
+    if (ep_int) {
+        us->recv_intr_pipe = usb_rcvintpipe(us->pusb_dev,
+            usb_endpoint_num(ep_int));
+        us->ep_bInterval = ep_int->bInterval;
+    }
+    return 0;
+}
+```
+
+##### 2.6.3.1 变量部分分析
+```C
+    struct usb_host_interface *alt = us->pusb_intf->cur_altsetting;
+    struct usb_endpoint_descriptor *ep_in;
+    struct usb_endpoint_descriptor *ep_out;
+    struct usb_endpoint_descriptor *ep_int;
+    int res;
+```
+&ensp;&ensp;&ensp;&ensp;alt变量为匹配上的USB接口下的当前接口设定结构体实例，可通过该变量找到端点及端点描述符；ep_in、ep_out、ep_int是端点描述符实例；res为结果收集。
+
+##### 2.6.3.2 usb_find_common_endpoints()函数解析
+```C
+    /*
+     * Find the first endpoint of each type we need.
+     * We are expecting a minimum of 2 endpoints - in and out (bulk).
+     * An optional interrupt-in is OK (necessary for CBI protocol).
+     * We will ignore any others.
+     */
+    res = usb_find_common_endpoints(alt, &ep_in, &ep_out, NULL, NULL);
+    if (res) {
+        usb_stor_dbg(us, "bulk endpoints not found\n");
+        return res;
+    }
+```
+&ensp;&ensp;&ensp;&ensp;这个函数的目的是找到bulk传输类型的ep_in和ep_out端点，因为USB mass storage主要就是bulk传输（一般只会实现bulk端点）。函数usb_find_common_endpoints()是USB core层实现的通用函数，主要是寻找alt接口下bulk端点和int端点；代码实现如下：
+```C
+/**
+ * usb_find_common_endpoints() -- look up common endpoint descriptors
+ * @alt:    alternate setting to search
+ * @bulk_in:    pointer to descriptor pointer, or NULL
+ * @bulk_out:   pointer to descriptor pointer, or NULL
+ * @int_in: pointer to descriptor pointer, or NULL
+ * @int_out:    pointer to descriptor pointer, or NULL
+ *
+ * Search the alternate setting's endpoint descriptors for the first bulk-in,
+ * bulk-out, interrupt-in and interrupt-out endpoints and return them in the
+ * provided pointers (unless they are NULL).
+ *
+ * If a requested endpoint is not found, the corresponding pointer is set to
+ * NULL.
+ *
+ * Return: Zero if all requested descriptors were found, or -ENXIO otherwise.
+ */
+int usb_find_common_endpoints(struct usb_host_interface *alt,
+        struct usb_endpoint_descriptor **bulk_in,
+        struct usb_endpoint_descriptor **bulk_out,
+        struct usb_endpoint_descriptor **int_in,
+        struct usb_endpoint_descriptor **int_out)
+{
+    struct usb_endpoint_descriptor *epd;
+    int i;
+
+    if (bulk_in)
+        *bulk_in = NULL;
+    if (bulk_out)
+        *bulk_out = NULL;
+    if (int_in)
+        *int_in = NULL;
+    if (int_out)
+        *int_out = NULL;
+
+    for (i = 0; i < alt->desc.bNumEndpoints; ++i) {
+        epd = &alt->endpoint[i].desc;
+
+        if (match_endpoint(epd, bulk_in, bulk_out, int_in, int_out))
+            return 0;
+    }
+
+    return -ENXIO;
+}
+EXPORT_SYMBOL_GPL(usb_find_common_endpoints);
+```
+&ensp;&ensp;&ensp;&ensp;此处传入的参数为alt，ep_out，ep_in；对应函数内的alt、bulk_in和bulk_out；继续分析：
+
+- 声明epd端点描述符变量；
+- 检查传入的bulk_in、bulk_out、int_in、int_out参数，并做初始化为NULL操作；
+- for循环查找alt->desc.bNumEndpoints个端点号，取出对应的&alt->endpoint[i].desc端点描述符结构，赋值给epd，再调用match_endpoint()来匹配所需的端点；
+###### 2.6.3.2.1 match_endpoint()函数分析
+```C
+static bool match_endpoint(struct usb_endpoint_descriptor *epd,
+        struct usb_endpoint_descriptor **bulk_in,
+        struct usb_endpoint_descriptor **bulk_out,
+        struct usb_endpoint_descriptor **int_in,
+        struct usb_endpoint_descriptor **int_out)
+{
+    switch (usb_endpoint_type(epd)) {
+    case USB_ENDPOINT_XFER_BULK:
+        if (usb_endpoint_dir_in(epd)) {
+            if (bulk_in && !*bulk_in) {
+                *bulk_in = epd;
+                break;
+            }
+        } else {
+            if (bulk_out && !*bulk_out) {
+                *bulk_out = epd;
+                break;
+            } 
+        }
+        
+        return false;
+    case USB_ENDPOINT_XFER_INT:
+        if (usb_endpoint_dir_in(epd)) {
+            if (int_in && !*int_in) {
+                *int_in = epd;
+                break;
+            }
+        } else {
+            if (int_out && !*int_out) {
+                *int_out = epd;
+                break;
+            }
+        }
+
+        return false;
+    default:
+        return false;
+    }
+
+    return (!bulk_in || *bulk_in) && (!bulk_out || *bulk_out) &&
+            (!int_in || *int_in) && (!int_out || *int_out);
+}
+```
+&ensp;&ensp;&ensp;&ensp;该函数的功能如下：
+
+- 通过函数usb_endpoint_type(epd)来确认该端点的传输类型，此处只做两种传输类型的匹配：USB_ENDPOINT_XFER_BULK和USB_ENDPOINT_XFER_INT，usb_endpoint_type()函数及各宏定义的实现如下：
+```C
+#define USB_ENDPOINT_XFERTYPE_MASK  0x03    /* in bmAttributes */
+#define USB_ENDPOINT_XFER_CONTROL   0
+#define USB_ENDPOINT_XFER_ISOC      1
+#define USB_ENDPOINT_XFER_BULK      2
+#define USB_ENDPOINT_XFER_INT       3
+
+/**
+ * usb_endpoint_type - get the endpoint's transfer type
+ * @epd: endpoint to be checked
+ *  
+ * Returns one of USB_ENDPOINT_XFER_{CONTROL, ISOC, BULK, INT} according
+ * to @epd's transfer type.
+ */
+static inline int usb_endpoint_type(const struct usb_endpoint_descriptor *epd)
+{
+    return epd->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
+}
+```
+&ensp;&ensp;&ensp;&ensp;即通过端点描述符下的bmAttributes元素进行匹配。该值也可以通过lsusb命令查看得到；
+
+- bulk传输模式下，再通过usb_endpoint_dir_in(epd)函数确认传输方向是否为IN，函数实现及相关宏定义如下：
+```C
+#define USB_ENDPOINT_DIR_MASK       0x80
+#define USB_DIR_IN          0x80        /* to host */
+
+/**
+ * usb_endpoint_dir_in - check if the endpoint has IN direction
+ * @epd: endpoint to be checked
+ *      
+ * Returns true if the endpoint is of type IN, otherwise it returns false.
+ */
+static inline int usb_endpoint_dir_in(const struct usb_endpoint_descriptor *epd)
+{
+    return ((epd->bEndpointAddress & USB_ENDPOINT_DIR_MASK) == USB_DIR_IN);
+}
+```
+&ensp;&ensp;&ensp;&ensp;如果是bulk_in，则将该端点epd赋值给*bulk_in变量；否则就给*bulk_out变量；
+
+- int传输模式下，通过usb_endpoint_dir_in(epd)确定epd方向，再赋值给对应的*int_in或*int_out；
+
+- 若符合以上条件，则返回true，否则返回false；
+
+##### 2.6.3.3 usb_find_int_in_endpoint()函数分析
+&ensp;&ensp;&ensp;&ensp;函数usb_find_int_in_endpoint()其实就是封装了usb_find_common_endpoints()，只是传给该函数的参数是给int_in，代码实现如下：
+```C
+    res = usb_find_int_in_endpoint(alt, &ep_int);
+    if (res && us->protocol == USB_PR_CBI) {
+        usb_stor_dbg(us, "interrupt endpoint not found\n");
+        return res;
+    }
+```
+```C
+static inline int __must_check
+usb_find_int_in_endpoint(struct usb_host_interface *alt,
+        struct usb_endpoint_descriptor **int_in)
+{
+    return usb_find_common_endpoints(alt, NULL, NULL, int_in, NULL);
+}
+```
+&ensp;&ensp;&ensp;&ensp;此部分是给CBI协议类型设备提供的，BOT协议类型设备一般是不实现中断端点的；
+
+##### 2.6.3.4 us赋值部分分析
+```C
+    /* Calculate and store the pipe values */
+    us->send_ctrl_pipe = usb_sndctrlpipe(us->pusb_dev, 0);
+    us->recv_ctrl_pipe = usb_rcvctrlpipe(us->pusb_dev, 0);
+    us->send_bulk_pipe = usb_sndbulkpipe(us->pusb_dev,
+        usb_endpoint_num(ep_out));
+    us->recv_bulk_pipe = usb_rcvbulkpipe(us->pusb_dev,
+        usb_endpoint_num(ep_in));
+    if (ep_int) { 
+        us->recv_intr_pipe = usb_rcvintpipe(us->pusb_dev,
+            usb_endpoint_num(ep_int)); 
+        us->ep_bInterval = ep_int->bInterval;
+    }
+```
+&ensp;&ensp;&ensp;&ensp;代码实现如下：
+
+- 通过usb_sndctrlpipe()计算端点0的发送control pipe，并赋值给us->send_ctrl_pipe。代码实现如下：
+```C
+#define PIPE_CONTROL            2
+
+static inline unsigned int __create_pipe(struct usb_device *dev,
+        unsigned int endpoint) 
+{
+    return (dev->devnum << 8) | (endpoint << 15);
+}
+
+#define usb_sndctrlpipe(dev, endpoint)  \
+    ((PIPE_CONTROL << 30) | __create_pipe(dev, endpoint))
+```
+
+- 通过usb_rcvctrlpipe()计算端点0的接收control pipe，并赋值给us->recv_ctrl_pipe。代码实现如下：
+```C
+#define usb_rcvctrlpipe(dev, endpoint)  \
+    ((PIPE_CONTROL << 30) | __create_pipe(dev, endpoint) | USB_DIR_IN)
+```
+
+- 通过usb_sndbulkpipe()计算发送bulk pipe，并赋值给us->send_bulk_pipe。代码实现如下：
+```C
+#define PIPE_BULK           3
+#define USB_ENDPOINT_NUMBER_MASK    0x0f    /* in bEndpointAddress */
+
+/** 
+ * usb_endpoint_num - get the endpoint's number
+ * @epd: endpoint to be checked
+ *
+ * Returns @epd's number: 0 to 15.
+ */
+static inline int usb_endpoint_num(const struct usb_endpoint_descriptor *epd)
+{
+    return epd->bEndpointAddress & USB_ENDPOINT_NUMBER_MASK;
+}
+
+#define usb_sndbulkpipe(dev, endpoint)  \
+    ((PIPE_BULK << 30) | __create_pipe(dev, endpoint))
+```
+&ensp;&ensp;&ensp;&ensp;通过ep_out和ep_in端点描述符的epd->bEndpointAddress获取到端点号，再计算出发送/接收bulk pipe值；
+
+- 通过usb_rcvbulkpipe()计算接收bulk  pipe，并赋值给us->recv_bulk_pipe。代码实现如下：
+```C
+#define usb_rcvbulkpipe(dev, endpoint)  \
+    ((PIPE_BULK << 30) | __create_pipe(dev, endpoint) | USB_DIR_IN)
+```
+
+- 如果有中断端点ep_int的话（此部分USB mass storage不会走），则通过usb_rcvintpipe()获取接收int pipe，并赋值给us->recv_intr_pipe，并设置us->ep_bInterval为端点中的ep_int->bInterval，usb_rcvintpipe()代码实现如下：
+```C
+#define usb_rcvintpipe(dev, endpoint)   \
+    ((PIPE_INTERRUPT << 30) | __create_pipe(dev, endpoint) | USB_DIR_IN)
+```
+
+#### 2.6.4 usb_stor_acquire_resources()函数解析
+&ensp;&ensp;&ensp;&ensp;该函数是USB storage驱动中的重头戏。里面实现了一个内核线程usb_stor_control_thread，就是该线程在操作数据的传输。代码实现如下：
+```C
+/* Initialize all the dynamic resources we need */
+static int usb_stor_acquire_resources(struct us_data *us)
+{
+    int p;
+    struct task_struct *th;
+
+    us->current_urb = usb_alloc_urb(0, GFP_KERNEL);
+    if (!us->current_urb)
+        return -ENOMEM;
+    
+    /*
+     * Just before we start our control thread, initialize
+     * the device if it needs initialization
+     */
+    if (us->unusual_dev->initFunction) {
+        p = us->unusual_dev->initFunction(us);
+        if (p)
+            return p;
+    }
+
+    /* Start up our control thread */
+    th = kthread_run(usb_stor_control_thread, us, "usb-storage");
+    if (IS_ERR(th)) {
+        dev_warn(&us->pusb_intf->dev,
+                "Unable to start control thread\n");
+        return PTR_ERR(th);
+    }
+    us->ctl_thread = th;
+
+    return 0;
+}
+```
+&ensp;&ensp;&ensp;&ensp;代码逻辑如下：
+
+- 首先利用usb_alloc_urb()申请一个urb：us->current_urb，usb_alloc_urb()是USB core层核心函数，此处不介绍；
+- 判断是否实现了us->unusual_dev->initFunction，即unusual dev的私有函数，实现了的话就在此处调用；
+- 创建一个内核线程usb_stor_control_thread，取名“usb-storage”，并将该线程号赋值给us->ctl_thread；后面再详细讲解该线程实现。
+
+#### 2.6.5 usb_autopm_get_interface_no_resume()介绍
+&ensp;&ensp;&ensp;&ensp;增加USB接口电源管理计数，代码实现如下：
+```C
+/**
+ * usb_autopm_get_interface_no_resume - increment a USB interface's PM-usage counter
+ * @intf: the usb_interface whose counter should be incremented
+ *      
+ * This routine increments @intf's usage counter but does not carry out an
+ * autoresume.
+ *  
+ * This routine can run in atomic context.
+ */
+void usb_autopm_get_interface_no_resume(struct usb_interface *intf)
+{
+    struct usb_device   *udev = interface_to_usbdev(intf);
+    
+    usb_mark_last_busy(udev);
+    atomic_inc(&intf->pm_usage_cnt);
+    pm_runtime_get_noresume(&intf->dev);
+}
+EXPORT_SYMBOL_GPL(usb_autopm_get_interface_no_resume);
+```
+
+#### 2.6.6 scsi_add_host()介绍
+&ensp;&ensp;&ensp;&ensp;相对于scsi控制器host的注册及使用，此处简单介绍一下。前面使用scsi_host_alloc()函数，它的作用就是给struct Scsi_Host结构体申请了空间，而真正要想模拟一个scsi的情景，需要三个函数：scsi_host_alloc()、scsi_add_host()、scsi_scan_host()；只有调用了第二个函数之后，scsi核心层才知道有这么一个host的存在，而在第三个函数被调用之后，真正的设备才被发现。
+&ensp;&ensp;&ensp;&ensp;所以，此处调用scsi_add_host()，是将USB storage所在的虚拟host通报给SCSI核心层，代码实现如下：
+```C
+    result = scsi_add_host(us_to_host(us), dev);
+    if (result) {
+        dev_warn(dev,
+                "Unable to add the scsi host\n");
+        goto HostAddErr;
+    }
+```
+
+#### 2.6.7 queue_delayed_work()调用分析
+```C
+    /* Submit the delayed_work for SCSI-device scanning */
+    set_bit(US_FLIDX_SCAN_PENDING, &us->dflags);
+
+    if (delay_use > 0)
+        dev_dbg(dev, "waiting for device to settle before scanning\n");
+    queue_delayed_work(system_freezable_wq, &us->scan_dwork,
+            delay_use * HZ);
+```
+&ensp;&ensp;&ensp;&ensp;这里需要分两个部分来解释，一个是us->dflags标记，一个是us->scan_dwork；下面分小节来讲解。
+
+##### 2.6.7.1 us->dflags标记作用
+&ensp;&ensp;&ensp;&ensp;经过分析，该标记主要是用来检测scsi控制器的状态之用，其在struct us_data结构体内的解释如下：
+```C
+    unsigned long       dflags;      /* dynamic atomic bitflags */
+```
+&ensp;&ensp;&ensp;&ensp;此处是在scsi_scan_host()函数调用前设置，标志马上进入scsi scan状态，该标志还在内核线程中做scsi cmd timeout状态检测，以及在scsi abort函数实现中做设置scsi cmd timeout状态等；稍后就会分析到；
+
+##### 2.6.7.2 queue_delayed_work()调用
+&ensp;&ensp;&ensp;&ensp;前面在2.5.3小节已经介绍在函数usb_stor_probe1()中已调用INIT_DELAYED_WORK()初始化了struct delayed_work us->scan_dwork，并赋予了执行函数：usb_stor_scan_dwork()，此处即将该延迟工作加入到的工作队列system_freezable_wq中；
+
+**==【注1】==**
+
+---
+&ensp;&ensp;&ensp;&ensp;以个人理解来分析一下system_freezable_wq工作队列，代码实现如下(本USB storage代码树中没有该函数实现副本，请参照主线内核)：
+```C
+struct workqueue_struct *system_freezable_wq __read_mostly;
+EXPORT_SYMBOL_GPL(system_freezable_wq);
+
+    system_freezable_wq = alloc_workqueue("events_freezable",
+                          WQ_FREEZABLE, 0);
+```
+&ensp;&ensp;&ensp;&ensp;WQ_FREEZABLE是一个和电源管理相关的内容。在系统Hibernation或者suspend的时候，有一个步骤就是冻结用户空间的进程以及部分（标注freezable的）内核线程（包括workqueue的worker thread）。标记WQ_FREEZABLE的workqueue需要参与到进程冻结的过程中，worker thread被冻结的时候，会处理完当前所有的work，一旦冻结完成，那么就不会启动新的work的执行，直到进程被解冻[^sample_1]。
+&ensp;&ensp;&ensp;&ensp;所以，当内核进入suspend状态时，会冻结该workqueue，导致，插拔U盘无反应？
+---
+
+&ensp;&ensp;&ensp;&ensp;此处的delay_use是和之前的quirks一样的，通过在sys文件系统下创建接口，可供用户层修改，默认值为1，代码实现及对应接口路径如下：
+```C
+static unsigned int delay_use = 1;
+module_param(delay_use, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(delay_use, "seconds to delay before using a new device");
+```
+```C
+~$ cat /sys/module/usb_storage/parameters/delay_use 
+1
+```
+
+##### 2.6.7.3 usb_stor_scan_dwork()函数实现
+&ensp;&ensp;&ensp;&ensp;此刻，我们该进入之前INIT_DELAYED_WORK(&us->scan_dwork, usb_stor_scan_dwork)中的延迟工作函数usb_stor_scan_dwork()分析了，代码如下：
+```C
+/* Delayed-work routine to carry out SCSI-device scanning */
+static void usb_stor_scan_dwork(struct work_struct *work)
+{
+    struct us_data *us = container_of(work, struct us_data,
+            scan_dwork.work);
+    struct device *dev = &us->pusb_intf->dev;
+
+    dev_dbg(dev, "starting scan\n");
+    
+    /* For bulk-only devices, determine the max LUN value */
+    if (us->protocol == USB_PR_BULK &&
+        !(us->fflags & US_FL_SINGLE_LUN) &&
+        !(us->fflags & US_FL_SCM_MULT_TARG)) {
+        mutex_lock(&us->dev_mutex);
+        us->max_lun = usb_stor_Bulk_max_lun(us);
+        /*
+         * Allow proper scanning of devices that present more than 8 LUNs
+         * While not affecting other devices that may need the previous
+         * behavior
+         */
+        if (us->max_lun >= 8)
+            us_to_host(us)->max_lun = us->max_lun+1;
+        mutex_unlock(&us->dev_mutex);
+    }
+    scsi_scan_host(us_to_host(us));
+    dev_dbg(dev, "scan complete\n");
+
+    /* Should we unbind if no devices were detected? */
+
+    usb_autopm_put_interface(us->pusb_intf);
+    clear_bit(US_FLIDX_SCAN_PENDING, &us->dflags);
+}
+```
+&ensp;&ensp;&ensp;&ensp;该函数的主要功能有两个：
+
+- 一个是获取host的max_lun，该值是从USB mass storage device中获得，由硬件提供，此处实现了一套通过control pipe向device发送control命令的流程；
+- 另一个是通过scsi_scan_host()，激活host主机控制器，完成struct Scsi_Host的注册及使用；
+&ensp;&ensp;&ensp;&ensp;下面再分解逐一讲解。
+
+###### 2.6.7.3.1 usb_stor_Bulk_max_lun()函数实现
+&ensp;&ensp;&ensp;&ensp;对于bulk-only devices，需要向device获取max LUN值，该部分实现如下：
+```C
+    struct us_data *us = container_of(work, struct us_data,
+            scan_dwork.work);
+    struct device *dev = &us->pusb_intf->dev;
+
+    /* For bulk-only devices, determine the max LUN value */
+    if (us->protocol == USB_PR_BULK &&
+        !(us->fflags & US_FL_SINGLE_LUN) &&
+        !(us->fflags & US_FL_SCM_MULT_TARG)) {
+        mutex_lock(&us->dev_mutex);
+        us->max_lun = usb_stor_Bulk_max_lun(us);
+        /*
+         * Allow proper scanning of devices that present more than 8 LUNs
+         * While not affecting other devices that may need the previous
+         * behavior
+         */
+        if (us->max_lun >= 8)
+            us_to_host(us)->max_lun = us->max_lun+1;
+        mutex_unlock(&us->dev_mutex);
+    }
+```
+&ensp;&ensp;&ensp;&ensp;已针对USB_PR_BULK协议以及US_FL_SINGLE_LUN和US_FL_SCM_MULT_TARG标记做了限制，通过调用usb_stor_Bulk_max_lun()函数来获取max lun，函数实现如下：
+```C
+/* Determine what the maximum LUN supported is */
+int usb_stor_Bulk_max_lun(struct us_data *us)
+{
+    int result;
+    
+    /* issue the command */
+    us->iobuf[0] = 0;
+    result = usb_stor_control_msg(us, us->recv_ctrl_pipe,
+                 US_BULK_GET_MAX_LUN, 
+                 USB_DIR_IN | USB_TYPE_CLASS |
+                 USB_RECIP_INTERFACE,
+                 0, us->ifnum, us->iobuf, 1, 10*HZ);
+
+    usb_stor_dbg(us, "GetMaxLUN command result is %d, data is %d\n",
+             result, us->iobuf[0]);
+            
+    /*
+     * If we have a successful request, return the result if valid. The
+     * CBW LUN field is 4 bits wide, so the value reported by the device
+     * should fit into that.
+     */
+    if (result > 0) {
+        if (us->iobuf[0] < 16) {
+            return us->iobuf[0];
+        } else {
+            dev_info(&us->pusb_intf->dev,
+                 "Max LUN %d is not valid, using 0 instead",
+                 us->iobuf[0]);
+        }
+    }
+
+    /*
+     * Some devices don't like GetMaxLUN.  They may STALL the control
+     * pipe, they may return a zero-length result, they may do nothing at
+     * all and timeout, or they may fail in even more bizarrely creative
+     * ways.  In these cases the best approach is to use the default
+     * value: only one LUN.
+     */
+    return 0;
+}
+```
+&ensp;&ensp;&ensp;&ensp;通过调用usb_stor_control_msg函数下发控制命令US_BULK_GET_MAX_LUN，该函数的参数需要分析一下，参见本github中的手册文档USB_Storage_spec.md[^sample_2]中对US_BULK_GET_MAX_LUN命令的说明，即下表命令规则：
+
+bmRequestType|bRequest|wValue|wIndex|wLength|Data
+--|--|--|--|--|--
+10100001b|11111110b|0000h|Interface|0001h|1 byte
+
+&ensp;&ensp;&ensp;&ensp;而函数参数对应关系如下：
+![](images/US_BULK_GET_MAX_LUN_cmd_parameter1.png)
+
+&ensp;&ensp;&ensp;&ensp;显然，此处是完全按照硬件协议规定来定义的，usb_stor_control_msg()函数实现如下：
+```C
+/*
+ * Transfer one control message, with timeouts, and allowing early
+ * termination.  Return codes are usual -Exxx, *not* USB_STOR_XFER_xxx.
+ */ 
+int usb_stor_control_msg(struct us_data *us, unsigned int pipe,
+         u8 request, u8 requesttype, u16 value, u16 index,
+         void *data, u16 size, int timeout)
+{
+    int status;
+
+    usb_stor_dbg(us, "rq=%02x rqtype=%02x value=%04x index=%02x len=%u\n",
+             request, requesttype, value, index, size);
+
+    /* fill in the devrequest structure */
+    us->cr->bRequestType = requesttype;
+    us->cr->bRequest = request;
+    us->cr->wValue = cpu_to_le16(value);
+    us->cr->wIndex = cpu_to_le16(index);
+    us->cr->wLength = cpu_to_le16(size);
+
+    /* fill and submit the URB */
+    usb_fill_control_urb(us->current_urb, us->pusb_dev, pipe,
+             (unsigned char*) us->cr, data, size,
+             usb_stor_blocking_completion, NULL);
+    status = usb_stor_msg_common(us, timeout);
+
+    /* return the actual length of the data transferred if no error */
+    if (status == 0)
+        status = us->current_urb->actual_length;
+    return status;
+}
+EXPORT_SYMBOL_GPL(usb_stor_control_msg);
+```
+&ensp;&ensp;&ensp;&ensp;us->cr在之前已经申请了内存空间，此处直接填充该结构，接着调用USB core层函数usb_fill_control_urb()来填充us->current_urb结构，并将urb->complete赋值为usb_stor_blocking_completion()，再调用usb_stor_msg_common()函数进一步处理并下发给USB HCD，usb_stor_blocking_completion()和usb_stor_msg_common()代码实现如下：
+
+---
+```C
+/*
+ * This is the completion handler which will wake us up when an URB
+ * completes.
+ */ 
+static void usb_stor_blocking_completion(struct urb *urb)
+{
+    struct completion *urb_done_ptr = urb->context;
+    
+    complete(urb_done_ptr);
+}
+```
+```C
+/*
+ * This is the common part of the URB message submission code
+ *
+ * All URBs from the usb-storage driver involved in handling a queued scsi
+ * command _must_ pass through this function (or something like it) for the
+ * abort mechanisms to work properly. 
+ */
+static int usb_stor_msg_common(struct us_data *us, int timeout)
+{
+    struct completion urb_done;
+    long timeleft;
+    int status;
+    
+    /* don't submit URBs during abort processing */
+    if (test_bit(US_FLIDX_ABORTING, &us->dflags))
+        return -EIO;
+
+    /* set up data structures for the wakeup system */
+    init_completion(&urb_done);
+
+    /* fill the common fields in the URB */
+    us->current_urb->context = &urb_done;
+    us->current_urb->transfer_flags = 0;
+
+    /*
+     * we assume that if transfer_buffer isn't us->iobuf then it
+     * hasn't been mapped for DMA.  Yes, this is clunky, but it's
+     * easier than always having the caller tell us whether the
+     * transfer buffer has already been mapped.
+     */
+    if (us->current_urb->transfer_buffer == us->iobuf)
+        us->current_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+    us->current_urb->transfer_dma = us->iobuf_dma;
+
+    /* submit the URB */
+    status = usb_submit_urb(us->current_urb, GFP_NOIO);
+    if (status) {
+        /* something went wrong */
+        return status;
+    }
+
+    /*
+     * since the URB has been submitted successfully, it's now okay
+     * to cancel it
+     */
+    set_bit(US_FLIDX_URB_ACTIVE, &us->dflags);
+
+    /* did an abort occur during the submission? */
+    if (test_bit(US_FLIDX_ABORTING, &us->dflags)) {
+
+        /* cancel the URB, if it hasn't been cancelled already */
+        if (test_and_clear_bit(US_FLIDX_URB_ACTIVE, &us->dflags)) {
+            usb_stor_dbg(us, "-- cancelling URB\n");
+            usb_unlink_urb(us->current_urb);
+        }
+    }
+
+    /* wait for the completion of the URB */
+    timeleft = wait_for_completion_interruptible_timeout(
+            &urb_done, timeout ? : MAX_SCHEDULE_TIMEOUT);
+
+    clear_bit(US_FLIDX_URB_ACTIVE, &us->dflags);
+
+    if (timeleft <= 0) {
+        usb_stor_dbg(us, "%s -- cancelling URB\n",
+                 timeleft == 0 ? "Timeout" : "Signal");
+        usb_kill_urb(us->current_urb);
+    }
+
+    /* return the URB status */
+    return us->current_urb->status;
+}
+```
+&ensp;&ensp;&ensp;&ensp;该函数工作流程如下：
+
+- 先设置us->dflags成US_FLIDX_ABORTING，以便处理urb；
+- 初始化完成量urb_done，并将该完成量赋值给us->current_urb->context，这在usb_stor_blocking_completion()中会调用complete()完成urb处理；
+- 接着是对传输buffer的设定；
+- 调用usb_submit_urb()上报urb给USB主机控制器；
+- 设置us->dflags为US_FLIDX_URB_ACTIVE，以及检测us->dflags；
+- 接着便是通过wait_for_completion_interruptible_timeout()等待urb_done被处理，或者超时；
+- 清除us->dflags位，表示urb已结束；
+- 检测timeleft确认urb是否下发有效，超时的话则调用usb_kill_urb(us->current_urb)清除urb；
+- 返回urb传输状态；
+
+---
+&ensp;&ensp;&ensp;&ensp;usb_stor_control_msg()函数接着检查usb_stor_msg_common()函数返回值，即status，如果无错误，则返回的status被赋值为us->current_urb->actual_length；
+
+---
+&ensp;&ensp;&ensp;&ensp;回到usb_stor_Bulk_max_lun()函数，再对usb_stor_control_msg()返回值result进行检查设置：
+
+- 如果命令下发成功，则device将返回一个1byte数据，只是LUNs值，所以返回了us->iobuf[0]值；
+- 而有些device则可能会对该命令STALL，则直接设置为0；
+- 简而言之，这个max LUN对通用USB mass storage device来说没啥意义，尽管如此，这也算是一次完整的host和device通信示例；
+
+###### 2.6.7.3.2 scsi_scan_host()函数介绍
+&ensp;&ensp;&ensp;&ensp;Scsi_Host主机控制器最后调用函数：扫描scsi主机控制器；至此USB模拟scsi控制器完成，U盘即可被应用层发现。应用层可通过scsi接口进行查看USB mass storage的状态。
+
+---
+&ensp;&ensp;&ensp;&ensp;函数最后两行：
+```C
+    usb_autopm_put_interface(us->pusb_intf);
+    clear_bit(US_FLIDX_SCAN_PENDING, &us->dflags);
+```
+
+- USB PM电源管理相关代码：usb_autopm_put_interface()，即此处准许USB接口设备autosuspend了；
+- 清除us->dflags的US_FLIDX_SCAN_PENDING标记，毕竟scan已经结束。
+
+
+### 2.7 内核线程数据传输解析
+
+
+
+
+
+
+
+---
+[^sample_1]: 该段摘抄[蜗窝科技](http://www.wowotech.net/irq_subsystem/cmwq-intro.html)博客文章内某段内容。
+[^sample_2]: USB_Storage_spec.md手册解析文档中的[1.2.1.2](https://github.com/TGSP/USB-storage-knowledge/blob/master/USB_Storage_spec.md)小节。
