@@ -1634,6 +1634,7 @@ EXPORT_SYMBOL_GPL(usb_autopm_get_interface_no_resume);
 
 #### 2.6.6 scsi_add_host()介绍
 &ensp;&ensp;&ensp;&ensp;相对于scsi控制器host的注册及使用，此处简单介绍一下。前面使用scsi_host_alloc()函数，它的作用就是给struct Scsi_Host结构体申请了空间，而真正要想模拟一个scsi的情景，需要三个函数：scsi_host_alloc()、scsi_add_host()、scsi_scan_host()；只有调用了第二个函数之后，scsi核心层才知道有这么一个host的存在，而在第三个函数被调用之后，真正的设备才被发现。
+
 &ensp;&ensp;&ensp;&ensp;所以，此处调用scsi_add_host()，是将USB storage所在的虚拟host通报给SCSI核心层，代码实现如下：
 ```C
     result = scsi_add_host(us_to_host(us), dev);
@@ -1658,6 +1659,7 @@ EXPORT_SYMBOL_GPL(usb_autopm_get_interface_no_resume);
 
 ##### 2.6.7.1 us->dflags标记作用
 &ensp;&ensp;&ensp;&ensp;经过分析，该标记主要是用来检测scsi控制器的状态之用，其在struct us_data结构体内的解释如下：
+
 ```C
     unsigned long       dflags;      /* dynamic atomic bitflags */
 ```
@@ -1678,7 +1680,9 @@ EXPORT_SYMBOL_GPL(system_freezable_wq);
                           WQ_FREEZABLE, 0);
 ```
 &ensp;&ensp;&ensp;&ensp;WQ_FREEZABLE是一个和电源管理相关的内容。在系统Hibernation或者suspend的时候，有一个步骤就是冻结用户空间的进程以及部分（标注freezable的）内核线程（包括workqueue的worker thread）。标记WQ_FREEZABLE的workqueue需要参与到进程冻结的过程中，worker thread被冻结的时候，会处理完当前所有的work，一旦冻结完成，那么就不会启动新的work的执行，直到进程被解冻[^sample_1]。
+
 &ensp;&ensp;&ensp;&ensp;所以，当内核进入suspend状态时，会冻结该workqueue，导致，插拔U盘无反应？
+
 ---
 
 &ensp;&ensp;&ensp;&ensp;此处的delay_use是和之前的quirks一样的，通过在sys文件系统下创建接口，可供用户层修改，默认值为1，代码实现及对应接口路径如下：
