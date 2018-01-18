@@ -1973,7 +1973,850 @@ static int usb_stor_msg_common(struct us_data *us, int timeout)
 - 清除us->dflags的US_FLIDX_SCAN_PENDING标记，毕竟scan已经结束。
 
 
-### 2.7 内核线程数据传输解析
+### 2.7 内核线程usb_stor_control_thread()数据传输解析
+&ensp;&ensp;&ensp;&ensp;终于进入USB storage传输的主体，也是USB storage最重要的一部分。现看函数实现：
+```C
+static int usb_stor_control_thread(void * __us)
+{
+    struct us_data *us = (struct us_data *)__us;
+    struct Scsi_Host *host = us_to_host(us);
+    struct scsi_cmnd *srb;
+        
+    for (;;) {
+        usb_stor_dbg(us, "*** thread sleeping\n");
+        if (wait_for_completion_interruptible(&us->cmnd_ready))
+            break;
+
+        usb_stor_dbg(us, "*** thread awakened\n");
+
+        /* lock the device pointers */
+        mutex_lock(&(us->dev_mutex));
+
+        /* lock access to the state */
+        scsi_lock(host);
+
+        /* When we are called with no command pending, we're done */
+        srb = us->srb;
+        if (srb == NULL) {
+            scsi_unlock(host);
+            mutex_unlock(&us->dev_mutex);
+            usb_stor_dbg(us, "-- exiting\n");
+            break;
+        }
+
+        /* has the command timed out *already* ? */
+        if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
+            srb->result = DID_ABORT << 16;
+            goto SkipForAbort;
+        }
+
+        scsi_unlock(host);
+
+        /*
+         * reject the command if the direction indicator
+         * is UNKNOWN
+         */
+        if (srb->sc_data_direction == DMA_BIDIRECTIONAL) {
+            usb_stor_dbg(us, "UNKNOWN data direction\n");
+            srb->result = DID_ERROR << 16;
+        }
+
+        /*
+         * reject if target != 0 or if LUN is higher than
+         * the maximum known LUN
+         */
+        else if (srb->device->id &&
+                !(us->fflags & US_FL_SCM_MULT_TARG)) {
+            usb_stor_dbg(us, "Bad target number (%d:%llu)\n",
+                       srb->device->id,
+                     srb->device->lun);
+            srb->result = DID_BAD_TARGET << 16;
+        }
+
+        else if (srb->device->lun > us->max_lun) {
+            usb_stor_dbg(us, "Bad LUN (%d:%llu)\n",
+                     srb->device->id,
+                     srb->device->lun);
+            srb->result = DID_BAD_TARGET << 16;
+        }
+
+        /*
+         * Handle those devices which need us to fake
+         * their inquiry data
+         */
+        else if ((srb->cmnd[0] == INQUIRY) &&
+                (us->fflags & US_FL_FIX_INQUIRY)) {
+            unsigned char data_ptr[36] = {
+                0x00, 0x80, 0x02, 0x02,
+                0x1F, 0x00, 0x00, 0x00};
+
+            usb_stor_dbg(us, "Faking INQUIRY command\n");
+            fill_inquiry_response(us, data_ptr, 36);
+            srb->result = SAM_STAT_GOOD;
+        }
+
+        /* we've got a command, let's do it! */
+        else {
+            US_DEBUG(usb_stor_show_command(us, srb));
+            us->proto_handler(srb, us);
+            usb_mark_last_busy(us->pusb_dev);
+        }
+
+        /* lock access to the state */
+        scsi_lock(host);
+
+        /* was the command aborted? */
+        if (srb->result == DID_ABORT << 16) {
+SkipForAbort:
+            usb_stor_dbg(us, "scsi command aborted\n");
+            srb = NULL; /* Don't call srb->scsi_done() */
+        }
+
+        /*
+         * If an abort request was received we need to signal that
+         * the abort has finished.  The proper test for this is
+         * the TIMED_OUT flag, not srb->result == DID_ABORT, because
+         * the timeout might have occurred after the command had
+         * already completed with a different result code.
+         */
+        if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
+            complete(&(us->notify));
+
+            /* Allow USB transfers to resume */
+            clear_bit(US_FLIDX_ABORTING, &us->dflags);
+            clear_bit(US_FLIDX_TIMED_OUT, &us->dflags);
+        }
+
+        /* finished working on this command */
+        us->srb = NULL;
+        scsi_unlock(host);
+
+        /* unlock the device pointers */
+        mutex_unlock(&us->dev_mutex);
+
+        /* now that the locks are released, notify the SCSI core */
+        if (srb) {
+            usb_stor_dbg(us, "scsi cmd done, result=0x%x\n",
+                    srb->result);
+            srb->scsi_done(srb);
+        }
+    } /* for (;;) */
+
+    /* Wait until we are told to stop */
+    for (;;) {
+        set_current_state(TASK_INTERRUPTIBLE);
+        if (kthread_should_stop())
+            break;
+        schedule();
+    }
+    __set_current_state(TASK_RUNNING);
+    return 0;
+}
+```
+&ensp;&ensp;&ensp;&ensp;直接进第一个for循环，第一部分，us->cmnd_ready完成量的调用，这个用于同步功能的完成量。
+
+#### 2.7.1  us->cmnd_ready解析
+us->cmnd_ready在本驱动中主要用于该内核线程和scsi中间层命令下发的同步，此处实现为：
+```C
+        if (wait_for_completion_interruptible(&us->cmnd_ready))
+            break;
+```
+&ensp;&ensp;&ensp;&ensp;调用complete(&us->cmnd_ready)的地方有两处，一个是在释放内核资源时调用，此处不解释；另一处则是在drivers/usb/storage/scsiglue.c中struct scsi_host_template usb_stor_host_template结构体实例中的queuecommand()函数中，即scsi中间层下发scsi cmd给USB storage驱动；
+
+---
+
+queuecommand()实现如下：
+```C
+/* queue a command */
+/* This is always called with scsi_lock(host) held */
+static int queuecommand_lck(struct scsi_cmnd *srb,
+            void (*done)(struct scsi_cmnd *))
+{
+    struct us_data *us = host_to_us(srb->device->host);
+
+    /* check for state-transition errors */
+    if (us->srb != NULL) {
+        printk(KERN_ERR USB_STORAGE "Error in %s: us->srb = %p\n",
+            __func__, us->srb);
+        return SCSI_MLQUEUE_HOST_BUSY;
+    }
+
+    /* fail the command if we are disconnecting */
+    if (test_bit(US_FLIDX_DISCONNECTING, &us->dflags)) {
+        usb_stor_dbg(us, "Fail command during disconnect\n");
+        srb->result = DID_NO_CONNECT << 16;
+        done(srb);
+        return 0;
+    }
+
+    /* enqueue the command and wake up the control thread */
+    srb->scsi_done = done;
+    us->srb = srb;
+    complete(&us->cmnd_ready);
+
+    return 0;
+}
+
+static DEF_SCSI_QCMD(queuecommand)
+```
+&ensp;&ensp;&ensp;&ensp;srb为scsi cmd的current srb，为struct scsi_cmnd结构体；该函数流程如下：
+
+- 检查之前的us->srb是否有效；
+- 检测us->dflags的US_FLIDX_DISCONNECTING标记；
+- 赋值；
+- 调用complete(&us->cmnd_ready)，实现与内核线程usb_stor_control_thread()同步；
+
+---
+
+#### 2.7.2 srb及us->dflags初步判断
+&ensp;&ensp;&ensp;&ensp;继续usb_stor_control_thread()函数；接下来对us->srb和us->dflags的US_FLIDX_TIMED_OUT做检测判断，此处使用了自旋锁及scsi_lock/unlock()，代码实现如下：
+```C
+        /* lock the device pointers */
+        mutex_lock(&(us->dev_mutex));
+
+        /* lock access to the state */
+        scsi_lock(host);
+
+        /* When we are called with no command pending, we're done */
+        srb = us->srb;
+        if (srb == NULL) {
+            scsi_unlock(host);
+            mutex_unlock(&us->dev_mutex);
+            usb_stor_dbg(us, "-- exiting\n");
+            break;
+        }
+
+        /* has the command timed out *already* ? */
+        if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
+            srb->result = DID_ABORT << 16;
+            goto SkipForAbort;
+        }
+
+        scsi_unlock(host);
+```
+
+#### 2.7.3 对srb结构进一步检测
+&ensp;&ensp;&ensp;&ensp;接下来将对由queuecommand()赋值的srb进行细致的检测，代码如下：
+```C
+        /*
+         * reject the command if the direction indicator
+         * is UNKNOWN
+         */
+        if (srb->sc_data_direction == DMA_BIDIRECTIONAL) {
+            usb_stor_dbg(us, "UNKNOWN data direction\n");
+            srb->result = DID_ERROR << 16;
+        }
+
+        /*
+         * reject if target != 0 or if LUN is higher than
+         * the maximum known LUN
+         */
+        else if (srb->device->id &&
+                !(us->fflags & US_FL_SCM_MULT_TARG)) {
+            usb_stor_dbg(us, "Bad target number (%d:%llu)\n",
+                     srb->device->id,
+                     srb->device->lun);
+            srb->result = DID_BAD_TARGET << 16;
+        }
+
+        else if (srb->device->lun > us->max_lun) {
+            usb_stor_dbg(us, "Bad LUN (%d:%llu)\n",
+                     srb->device->id,
+                     srb->device->lun);
+            srb->result = DID_BAD_TARGET << 16;
+        }
+
+        /*
+         * Handle those devices which need us to fake
+         * their inquiry data
+         */
+        else if ((srb->cmnd[0] == INQUIRY) &&
+                (us->fflags & US_FL_FIX_INQUIRY)) {
+            unsigned char data_ptr[36] = {
+                0x00, 0x80, 0x02, 0x02,
+                0x1F, 0x00, 0x00, 0x00};
+
+            usb_stor_dbg(us, "Faking INQUIRY command\n");
+            fill_inquiry_response(us, data_ptr, 36);
+            srb->result = SAM_STAT_GOOD;
+        }
+
+        /* we've got a command, let's do it! */
+        else {
+            US_DEBUG(usb_stor_show_command(us, srb));
+            us->proto_handler(srb, us);
+            usb_mark_last_busy(us->pusb_dev);
+        }
+```
+&ensp;&ensp;&ensp;&ensp;代码流程如下：
+
+- 检查数据传输方向srb->sc_data_direction，若未指定，则表示错误，赋值错误码；
+- 检查硬件没有设置US_FL_SCM_MULT_TARG标记，但是获得的srb->device->id却大于0的情况；
+- 检查srb->device->lun指定的值大于从硬件获取的max_lun值的情况；
+- 硬件不支持US_FL_FIX_INQUIRY标记，即SCSI INQUIRY命令的情况，这部分在2.7.3.1小节介绍；
+- 所有的判断都没问题的话，则可调用us->proto_handler(srb, us)了，这部分在2.7.4节介绍；
+
+#####  2.7.3.1 USB storage device不支持INQUIRY情况分析
+&ensp;&ensp;&ensp;&ensp;先看代码实现：
+```C
+        /*
+         * Handle those devices which need us to fake
+         * their inquiry data
+         */
+        else if ((srb->cmnd[0] == INQUIRY) &&
+                (us->fflags & US_FL_FIX_INQUIRY)) {
+            unsigned char data_ptr[36] = {
+                0x00, 0x80, 0x02, 0x02,
+                0x1F, 0x00, 0x00, 0x00};
+
+            usb_stor_dbg(us, "Faking INQUIRY command\n");
+            fill_inquiry_response(us, data_ptr, 36);
+            srb->result = SAM_STAT_GOOD;
+        }
+```
+&ensp;&ensp;&ensp;&ensp;scsi 子系统里的设备使用 scsi 命令来通信,scsi spec 定义了一大堆的命令,spec 里称这个为命令集,即所谓的 command set.其中一些命令是每一个 scsi 设备都必须支持的,另一些命令则是可选的.而作为 U盘,它所支持的是 scsi transparent command set,所以它基本上就是支持所有的 scsi 命令了,不过我们其实并不关心任何一个具体的命令,只需要了解一些最基本的命令就是了.比如我们需要知道,所有的 scsi设备都至少需要支持以下这四个 scsi 命令:INQUIRY,REQUEST SENSE,SEND DIAGNOSTIC,TEST UNIT READY。
+
+&ensp;&ensp;&ensp;&ensp;事实上，INQUIRY命令是最最基本的一个SCSI命令，比如主机第一次探测device的时候就要用INQUIRY命令来了解这是一个什么设备。通常大多数设备的vendor name 和 product name 是通过 INQUIRY 命令来获得的,而这个 us->fflag 表明,这些设备的 vendor name 和 product name 不需要查询,或者根本就不支持查询,她们的 vendor name 和 product name直接就定义好了,在 unusal_devs.h 中就设好了。
+
+&ensp;&ensp;&ensp;&ensp;此处的srb->cmnd[0]包含的就是一个scsi命令，这个判断的意思是，如果device不支持scsi的INQUIRY命令，则USB storage直接在此处封装一个INQUIRY命令的返回结果给scsi中间层，这样就做到两边都满意了。先继续看fill_inquiry_response()函数：
+```C
+/*
+ * fill_inquiry_response takes an unsigned char array (which must
+ * be at least 36 characters) and populates the vendor name,
+ * product name, and revision fields. Then the array is copied
+ * into the SCSI command's response buffer (oddly enough
+ * called request_buffer). data_len contains the length of the
+ * data array, which again must be at least 36.
+ */
+
+void fill_inquiry_response(struct us_data *us, unsigned char *data,
+        unsigned int data_len)
+{
+    if (data_len < 36) /* You lose. */
+        return;
+
+    memset(data+8, ' ', 28);
+    if (data[0]&0x20) { /*
+                 * USB device currently not connected. Return
+                 * peripheral qualifier 001b ("...however, the
+                 * physical device is not currently connected
+                 * to this logical unit") and leave vendor and
+                 * product identification empty. ("If the target
+                 * does store some of the INQUIRY data on the
+                 * device, it may return zeros or ASCII spaces
+                 * (20h) in those fields until the data is
+                 * available from the device.").
+                 */
+    } else {
+        u16 bcdDevice = le16_to_cpu(us->pusb_dev->descriptor.bcdDevice);
+        int n;
+
+        n = strlen(us->unusual_dev->vendorName);
+        memcpy(data+8, us->unusual_dev->vendorName, min(8, n));
+        n = strlen(us->unusual_dev->productName);
+        memcpy(data+16, us->unusual_dev->productName, min(16, n));
+
+        data[32] = 0x30 + ((bcdDevice>>12) & 0x0F);
+        data[33] = 0x30 + ((bcdDevice>>8) & 0x0F);
+        data[34] = 0x30 + ((bcdDevice>>4) & 0x0F);
+        data[35] = 0x30 + ((bcdDevice) & 0x0F);
+    }
+
+    usb_stor_set_xfer_buf(data, data_len, us->srb);
+}
+EXPORT_SYMBOL_GPL(fill_inquiry_response);
+```
+&ensp;&ensp;&ensp;&ensp;每个SCSI命令，在device应答时，都是依据SCSI协议里规定的格式。所以相对INQUIRY命令，规范中规定，响应数据必须至少包含36各字节，所以函数开头就直接检测这个data_len必须至少36字节。
+
+######  2.7.3.1.1 sg_inq工具查询INQUIRY命令
+&ensp;&ensp;&ensp;&ensp;此处推荐一个可以查询SCSI命令的工具，安装包sg3-utils，然后就可以看到一个sg_inq命令了，其它sg_*没有研究过，此处只介绍下sg_inq命令，插入U盘，运行命令：
+```C
+$ sudo sg_inq /dev/sdb
+standard INQUIRY:
+  PQual=0  Device_type=0  RMB=1  LU_CONG=0  version=0x06  [SPC-4]
+  [AERC=0]  [TrmTsk=0]  NormACA=0  HiSUP=0  Resp_data_format=2
+  SCCS=0  ACC=0  TPGS=0  3PC=0  Protect=0  [BQue=0]
+  EncServ=0  MultiP=0  [MChngr=0]  [ACKREQQ=0]  Addr16=0
+  [RelAdr=0]  WBus16=0  Sync=0  [Linked=0]  [TranDis=0]  CmdQue=0
+    length=36 (0x24)   Peripheral device type: disk
+ Vendor identification: Kingston
+ Product identification: DataTraveler 2.0
+ Product revision level: PMAP
+ Unit serial number: CB806100040A 
+```
+&ensp;&ensp;&ensp;&ensp;这里面看得懂的信息并不多，但是length=36，显示了命令响应的长度，以及Vendor ID，Product ID，Product revision等；
+
+######  2.7.3.1.2 fill_inquiry_response()函数解析 
+==【data数据说明及填充】==
+&ensp;&ensp;&ensp;&ensp;继续fill_inquiry_response()，接下来的两句：
+```C
+memset(data+8, ' ', 28);
+    if (data[0]&0x20) {
+```
+&ensp;&ensp;&ensp;&ensp;SCSI协议规定了，标准的INQUIRY命令的data[0]，总共8个bit位，其中bit[7:5]被称为peripheral qualifier，bit[4:0]被称为perpheral device type；此处的0x20就表示peripheral qualifier 这个外围设备限定符为 001b，而 peripheral device type这个外围设备类型则为 00h。查询SCSI协议可知，后者代表的是设备类型为磁盘，或者说直接访问设备；前者代表的是目标设备的当前LUN支持这种类型，然而，实际的物理设备并没有连接在当前LUN上。
+
+&ensp;&ensp;&ensp;&ensp;在data[36]中，从data[8]一直到data[35]这28个字节都是保存的vendor和product的信息，SCSI协议里面写了，如果设备里有保存这些信息，那么它可以暂时先返回0x20h，所以可以先把data[8]到data[35]都给设置成空，等到保存在设备上的这些信息可以读了再去读[^sample_3]。
+
+&ensp;&ensp;&ensp;&ensp;此处fill_inquiry_response()传入的data的data[0]不是0x20，所以继续分析：
+```C
+        u16 bcdDevice = le16_to_cpu(us->pusb_dev->descriptor.bcdDevice);
+        int n;
+
+        n = strlen(us->unusual_dev->vendorName);
+        memcpy(data+8, us->unusual_dev->vendorName, min(8, n));
+        n = strlen(us->unusual_dev->productName);
+        memcpy(data+16, us->unusual_dev->productName, min(16, n));
+
+        data[32] = 0x30 + ((bcdDevice>>12) & 0x0F);
+        data[33] = 0x30 + ((bcdDevice>>8) & 0x0F);
+        data[34] = 0x30 + ((bcdDevice>>4) & 0x0F);
+        data[35] = 0x30 + ((bcdDevice) & 0x0F);
+```
+
+- 将bcdDevice、us->unusual_dev->vendorName的前8位，us->unusual_dev->productName的前16位分别填充到data[8] - data[35]；
+- 当然，此处都是针对那些unusual devs来说的。像遵守通用协议的设备来说，则不需要如此。
+- 在继续之前，再解释下fill_inquiry_response()参数data_ptr数组的前8字节的含义：
+    - data_ptr[0]已经介绍过；
+    - data_ptr[1]被赋值为0x80，表示这个设备是可移除的；
+    - data_ptr[2]被赋值为0x02，表示设备遵循SCSI-2；
+    - data_ptr[3]被赋值为0x02，表示数据格式遵循国际标准化组织所规定的格式；
+    - data_ptr[4]被赋值为0x1F，该字节被称为additional length，附加参数的长度，即除了用这么一个标准格式的数据响应之外，可能还会返回更多的一些信息；
+    
+==【usb_stor_set_xfer_buf()函数解析】==
+&ensp;&ensp;&ensp;&ensp;函数实现如下，正如英文注释，即存储该buffer内容到srb的transfer buffer中，并设置SCSI residue。
+
+~~~C
+/*
+ * Store the contents of buffer into srb's transfer buffer and set the
+ * SCSI residue.
+ */
+void usb_stor_set_xfer_buf(unsigned char *buffer,
+    unsigned int buflen, struct scsi_cmnd *srb)
+{
+    unsigned int offset = 0;
+    struct scatterlist *sg = NULL;
+
+    buflen = min(buflen, scsi_bufflen(srb));
+    buflen = usb_stor_access_xfer_buf(buffer, buflen, srb, &sg, &offset,
+            TO_XFER_BUF);
+    if (buflen < scsi_bufflen(srb))
+        scsi_set_resid(srb, scsi_bufflen(srb) - buflen);
+}
+EXPORT_SYMBOL_GPL(usb_stor_set_xfer_buf);
+~~~
+
+&ensp;&ensp;&ensp;&ensp;取buflen和scsi_bufflen(srb)之间最小值，继续跟踪usb_stor_access_xfer_buf()函数，此函数设计到内存管理；代码实现如下：
+```C
+/*
+ * Copy a buffer of length buflen to/from the srb's transfer buffer.
+ * Update the **sgptr and *offset variables so that the next copy will
+ * pick up from where this one left off.
+ */
+unsigned int usb_stor_access_xfer_buf(unsigned char *buffer,
+    unsigned int buflen, struct scsi_cmnd *srb, struct scatterlist **sgptr,
+    unsigned int *offset, enum xfer_buf_dir dir)
+{
+    unsigned int cnt = 0;
+    struct scatterlist *sg = *sgptr;
+    struct sg_mapping_iter miter;
+    unsigned int nents = scsi_sg_count(srb); 
+
+    if (sg)
+        nents = sg_nents(sg);
+    else
+        sg = scsi_sglist(srb);
+
+    sg_miter_start(&miter, sg, nents, dir == FROM_XFER_BUF ?
+        SG_MITER_FROM_SG: SG_MITER_TO_SG);
+
+    if (!sg_miter_skip(&miter, *offset))
+        return cnt;
+
+    while (sg_miter_next(&miter) && cnt < buflen) {
+        unsigned int len = min_t(unsigned int, miter.length,
+                buflen - cnt);
+
+        if (dir == FROM_XFER_BUF)
+            memcpy(buffer + cnt, miter.addr, len);
+        else
+            memcpy(miter.addr, buffer + cnt, len);
+
+        if (*offset + len < miter.piter.sg->length) {
+            *offset += len;
+            *sgptr = miter.piter.sg;
+        } else {
+            *offset = 0;
+            *sgptr = sg_next(miter.piter.sg);
+        }
+        cnt += len;
+    }
+    sg_miter_stop(&miter);
+
+    return cnt;
+}
+EXPORT_SYMBOL_GPL(usb_stor_access_xfer_buf);
+```
+&ensp;&ensp;&ensp;&ensp;先介绍下scatter/gather，这是一种用于高性能IO的标准技术，通常意味着一种DMA传输方式，对于一个给定的数据块，可能在内存中存在于一些离散的缓冲区，换言之，就是说一些不连续的内存缓冲区一起保存一个数据块，如果没有 scatter/gather呢，那么当我们要建立一个从内存到磁盘的传输，那么操作系统通常会为每一个buffer做一次传输，或者干脆就是把这些不连续的buffer里边的冬冬全都移动到另一个很大的buffer里边，然后再开始传输。那么这两种方法显然都是效率不高的。毫无疑问，如果【操作系统/驱动程序/硬件】能够把这些来自内存中离散位置的数据收集起来(gather up)并转移她们到适当位置整个这个步骤是一个单一的操作的话，效率肯定就会更高。反之，如果要从磁盘向内存中传输，而有一个单一的操作能够把数据块直接分散开来(scatter)到达内存中需要的位置，而不再需要中间的那个块移动，或者别的方法，那么显然，效率总会更高。
+
+&ensp;&ensp;&ensp;&ensp;尽管如此，此处的sg_miter_start()、sg_miter_skip()、sg_miter_next()、sg_miter_stop()函数仍然很难理解，暂且不介绍，等以后学精了再补充；
+
+&ensp;&ensp;&ensp;&ensp;回到usb_stor_set_xfer_buf()函数，有关SCSI residue的设定，residue是指在一次传输中，数据并未传输完，则先记下还剩未传输的部分。
+
+---
+
+&ensp;&ensp;&ensp;&ensp;总之，usb_stor_set_xfer_buf()函数的目的，就是将填充好的data数据结构，拷贝到us->srb的transfer buffer中，以反馈回SCSI中间层；
+
+&ensp;&ensp;&ensp;&ensp;回到usb_stor_control_thread()内核线程，srb->result = SAM_STAT_GOOD，填充完srb后，再设置命令处理结果标记，标志命令已被device"处理"。
+
+#### 2.7.4 us->proto_handler处理
+&ensp;&ensp;&ensp;&ensp;如果所有的检测都已通过，则USB storage驱动层已获取到srb命令，现在是调用协议层和传输层来完成命令的下发。
+
+&ensp;&ensp;&ensp;&ensp;us->proto_handler(srb, us)函数在usb_stor_probe1()的get_protocol()函数中指定，因为U盘遵循USB_SC_SCSI协议，所以直接调用usb_stor_transparent_scsi_command()。
+
+##### 2.7.4.1 usb_stor_transparent_scsi_command()函数一览
+&ensp;&ensp;&ensp;&ensp;函数实现如下：
+```C
+void usb_stor_transparent_scsi_command(struct scsi_cmnd *srb,
+                       struct us_data *us)
+{
+    /* send the command to the transport layer */
+    usb_stor_invoke_transport(srb, us);
+}
+EXPORT_SYMBOL_GPL(usb_stor_transparent_scsi_command);
+```
+```C
+/*
+ * Invoke the transport and basic error-handling/recovery methods
+ *  
+ * This is used by the protocol layers to actually send the message to
+ * the device and receive the response.
+ */
+void usb_stor_invoke_transport(struct scsi_cmnd *srb, struct us_data *us)
+{
+    int need_auto_sense;
+    int result;
+ 
+    /* send the command to the transport layer */
+    scsi_set_resid(srb, 0);
+    result = us->transport(srb, us);
+
+    /*
+     * if the command gets aborted by the higher layers, we need to
+     * short-circuit all other processing
+     */
+    if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
+        usb_stor_dbg(us, "-- command was aborted\n");
+        srb->result = DID_ABORT << 16;
+        goto Handle_Errors;
+    }
+    
+    /* if there is a transport error, reset and don't auto-sense */
+    if (result == USB_STOR_TRANSPORT_ERROR) {
+        usb_stor_dbg(us, "-- transport indicates error, resetting\n");
+        srb->result = DID_ERROR << 16;
+        goto Handle_Errors;
+    }
+
+    /* if the transport provided its own sense data, don't auto-sense */
+    if (result == USB_STOR_TRANSPORT_NO_SENSE) {
+        srb->result = SAM_STAT_CHECK_CONDITION;
+        last_sector_hacks(us, srb);
+        return;
+    }
+
+    srb->result = SAM_STAT_GOOD;
+
+    /*
+     * Determine if we need to auto-sense
+     *
+     * I normally don't use a flag like this, but it's almost impossible
+     * to understand what's going on here if I don't.
+     */
+    need_auto_sense = 0;
+
+    /*
+     * If we're running the CB transport, which is incapable
+     * of determining status on its own, we will auto-sense
+     * unless the operation involved a data-in transfer.  Devices
+     * can signal most data-in errors by stalling the bulk-in pipe.
+     */
+    if ((us->protocol == USB_PR_CB || us->protocol == USB_PR_DPCM_USB) &&
+            srb->sc_data_direction != DMA_FROM_DEVICE) {
+        usb_stor_dbg(us, "-- CB transport device requiring auto-sense\n");
+        need_auto_sense = 1;
+    }
+
+    /*
+     * If we have a failure, we're going to do a REQUEST_SENSE 
+     * automatically.  Note that we differentiate between a command
+     * "failure" and an "error" in the transport mechanism.
+     */
+    if (result == USB_STOR_TRANSPORT_FAILED) {
+        usb_stor_dbg(us, "-- transport indicates command failure\n");
+        need_auto_sense = 1;
+    }
+
+    /*
+     * Determine if this device is SAT by seeing if the
+     * command executed successfully.  Otherwise we'll have
+     * to wait for at least one CHECK_CONDITION to determine
+     * SANE_SENSE support
+     */
+    if (unlikely((srb->cmnd[0] == ATA_16 || srb->cmnd[0] == ATA_12) &&
+        result == USB_STOR_TRANSPORT_GOOD &&
+        !(us->fflags & US_FL_SANE_SENSE) &&
+        !(us->fflags & US_FL_BAD_SENSE) &&
+        !(srb->cmnd[2] & 0x20))) {
+        usb_stor_dbg(us, "-- SAT supported, increasing auto-sense\n");
+        us->fflags |= US_FL_SANE_SENSE;
+    }
+
+    /*
+     * A short transfer on a command where we don't expect it
+     * is unusual, but it doesn't mean we need to auto-sense.
+     */
+    if ((scsi_get_resid(srb) > 0) &&
+        !((srb->cmnd[0] == REQUEST_SENSE) ||
+          (srb->cmnd[0] == INQUIRY) ||
+          (srb->cmnd[0] == MODE_SENSE) ||
+          (srb->cmnd[0] == LOG_SENSE) ||
+          (srb->cmnd[0] == MODE_SENSE_10))) {
+        usb_stor_dbg(us, "-- unexpectedly short transfer\n");
+    }
+
+    /* Now, if we need to do the auto-sense, let's do it */
+    if (need_auto_sense) {
+        int temp_result;
+        struct scsi_eh_save ses;
+        int sense_size = US_SENSE_SIZE;
+        struct scsi_sense_hdr sshdr;
+        const u8 *scdd;
+        u8 fm_ili;
+
+        /* device supports and needs bigger sense buffer */
+        if (us->fflags & US_FL_SANE_SENSE)
+            sense_size = ~0;
+Retry_Sense:
+        usb_stor_dbg(us, "Issuing auto-REQUEST_SENSE\n");
+
+        scsi_eh_prep_cmnd(srb, &ses, NULL, 0, sense_size);
+
+        /* FIXME: we must do the protocol translation here */
+        if (us->subclass == USB_SC_RBC || us->subclass == USB_SC_SCSI ||
+                us->subclass == USB_SC_CYP_ATACB)
+            srb->cmd_len = 6;
+        else
+            srb->cmd_len = 12;
+
+        /* issue the auto-sense command */
+        scsi_set_resid(srb, 0);
+        temp_result = us->transport(us->srb, us);
+
+        /* let's clean up right away */
+        scsi_eh_restore_cmnd(srb, &ses);
+
+        if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
+            usb_stor_dbg(us, "-- auto-sense aborted\n");
+            srb->result = DID_ABORT << 16;
+
+            /* If SANE_SENSE caused this problem, disable it */
+            if (sense_size != US_SENSE_SIZE) {
+                us->fflags &= ~US_FL_SANE_SENSE;
+                us->fflags |= US_FL_BAD_SENSE;
+            }
+            goto Handle_Errors;
+        }
+
+        /*
+         * Some devices claim to support larger sense but fail when
+         * trying to request it. When a transport failure happens
+         * using US_FS_SANE_SENSE, we always retry with a standard
+         * (small) sense request. This fixes some USB GSM modems
+         */
+        if (temp_result == USB_STOR_TRANSPORT_FAILED &&
+                sense_size != US_SENSE_SIZE) {
+            usb_stor_dbg(us, "-- auto-sense failure, retry small sense\n");
+            sense_size = US_SENSE_SIZE;
+            us->fflags &= ~US_FL_SANE_SENSE;
+            us->fflags |= US_FL_BAD_SENSE;
+            goto Retry_Sense;
+        }
+
+        /* Other failures */
+        if (temp_result != USB_STOR_TRANSPORT_GOOD) {
+            usb_stor_dbg(us, "-- auto-sense failure\n");
+
+            /*
+             * we skip the reset if this happens to be a
+             * multi-target device, since failure of an
+             * auto-sense is perfectly valid
+             */
+            srb->result = DID_ERROR << 16;
+            if (!(us->fflags & US_FL_SCM_MULT_TARG))
+                goto Handle_Errors;
+            return;
+        }
+
+        /*
+         * If the sense data returned is larger than 18-bytes then we
+         * assume this device supports requesting more in the future.
+         * The response code must be 70h through 73h inclusive.
+         */
+        if (srb->sense_buffer[7] > (US_SENSE_SIZE - 8) &&
+            !(us->fflags & US_FL_SANE_SENSE) &&
+            !(us->fflags & US_FL_BAD_SENSE) &&
+            (srb->sense_buffer[0] & 0x7C) == 0x70) {
+            usb_stor_dbg(us, "-- SANE_SENSE support enabled\n");
+            us->fflags |= US_FL_SANE_SENSE;
+
+            /*
+             * Indicate to the user that we truncated their sense
+             * because we didn't know it supported larger sense.
+             */
+            usb_stor_dbg(us, "-- Sense data truncated to %i from %i\n",
+                     US_SENSE_SIZE,
+                     srb->sense_buffer[7] + 8);
+            srb->sense_buffer[7] = (US_SENSE_SIZE - 8);
+        }
+
+        scsi_normalize_sense(srb->sense_buffer, SCSI_SENSE_BUFFERSIZE,
+                     &sshdr);
+
+        usb_stor_dbg(us, "-- Result from auto-sense is %d\n",
+                 temp_result);
+        usb_stor_dbg(us, "-- code: 0x%x, key: 0x%x, ASC: 0x%x, ASCQ: 0x%x\n",
+                 sshdr.response_code, sshdr.sense_key,
+                 sshdr.asc, sshdr.ascq);
+#ifdef CONFIG_USB_STORAGE_DEBUG
+        usb_stor_show_sense(us, sshdr.sense_key, sshdr.asc, sshdr.ascq);
+#endif
+
+        /* set the result so the higher layers expect this data */
+        srb->result = SAM_STAT_CHECK_CONDITION;
+
+        scdd = scsi_sense_desc_find(srb->sense_buffer,
+                        SCSI_SENSE_BUFFERSIZE, 4);
+        fm_ili = (scdd ? scdd[3] : srb->sense_buffer[2]) & 0xA0;
+
+        /*
+         * We often get empty sense data.  This could indicate that
+         * everything worked or that there was an unspecified
+         * problem.  We have to decide which.
+         */
+        if (sshdr.sense_key == 0 && sshdr.asc == 0 && sshdr.ascq == 0 &&
+            fm_ili == 0) {
+            /*
+             * If things are really okay, then let's show that.
+             * Zero out the sense buffer so the higher layers
+             * won't realize we did an unsolicited auto-sense.
+             */
+            if (result == USB_STOR_TRANSPORT_GOOD) {
+                srb->result = SAM_STAT_GOOD;
+                srb->sense_buffer[0] = 0x0;
+            }
+
+            /*
+             * ATA-passthru commands use sense data to report
+             * the command completion status, and often devices
+             * return Check Condition status when nothing is
+             * wrong.
+             */
+            else if (srb->cmnd[0] == ATA_16 ||
+                    srb->cmnd[0] == ATA_12) {
+                /* leave the data alone */
+            }
+
+            /*
+             * If there was a problem, report an unspecified
+             * hardware error to prevent the higher layers from
+             * entering an infinite retry loop.
+             */
+            else {
+                srb->result = DID_ERROR << 16;
+                if ((sshdr.response_code & 0x72) == 0x72)
+                    srb->sense_buffer[1] = HARDWARE_ERROR;
+                else
+                    srb->sense_buffer[2] = HARDWARE_ERROR;
+            }
+        }
+    }
+
+    /*
+     * Some devices don't work or return incorrect data the first
+     * time they get a READ(10) command, or for the first READ(10)
+     * after a media change.  If the INITIAL_READ10 flag is set,
+     * keep track of whether READ(10) commands succeed.  If the
+     * previous one succeeded and this one failed, set the REDO_READ10
+     * flag to force a retry.
+     */
+    if (unlikely((us->fflags & US_FL_INITIAL_READ10) &&
+            srb->cmnd[0] == READ_10)) {
+        if (srb->result == SAM_STAT_GOOD) {
+            set_bit(US_FLIDX_READ10_WORKED, &us->dflags);
+        } else if (test_bit(US_FLIDX_READ10_WORKED, &us->dflags)) {
+            clear_bit(US_FLIDX_READ10_WORKED, &us->dflags);
+            set_bit(US_FLIDX_REDO_READ10, &us->dflags);
+        }
+
+        /*
+         * Next, if the REDO_READ10 flag is set, return a result
+         * code that will cause the SCSI core to retry the READ(10)
+         * command immediately.
+         */
+        if (test_bit(US_FLIDX_REDO_READ10, &us->dflags)) {
+            clear_bit(US_FLIDX_REDO_READ10, &us->dflags);
+            srb->result = DID_IMM_RETRY << 16;
+            srb->sense_buffer[0] = 0;
+        }
+    }
+
+    /* Did we transfer less than the minimum amount required? */
+    if ((srb->result == SAM_STAT_GOOD || srb->sense_buffer[2] == 0) &&
+            scsi_bufflen(srb) - scsi_get_resid(srb) < srb->underflow)
+        srb->result = DID_ERROR << 16;
+
+    last_sector_hacks(us, srb);
+    return;
+
+    /*
+     * Error and abort processing: try to resynchronize with the device
+     * by issuing a port reset.  If that fails, try a class-specific
+     * device reset.
+     */
+  Handle_Errors:
+
+    /*
+     * Set the RESETTING bit, and clear the ABORTING bit so that
+     * the reset may proceed.
+     */
+    scsi_lock(us_to_host(us));
+    set_bit(US_FLIDX_RESETTING, &us->dflags);
+    clear_bit(US_FLIDX_ABORTING, &us->dflags);
+    scsi_unlock(us_to_host(us));
+
+    /*
+     * We must release the device lock because the pre_reset routine
+     * will want to acquire it.
+     */
+    mutex_unlock(&us->dev_mutex);
+    result = usb_stor_port_reset(us);
+    mutex_lock(&us->dev_mutex);
+
+    if (result < 0) {
+        scsi_lock(us_to_host(us));
+        usb_stor_report_device_reset(us);
+        scsi_unlock(us_to_host(us));
+        us->transport_reset(us);
+    }
+    clear_bit(US_FLIDX_RESETTING, &us->dflags);
+    last_sector_hacks(us, srb);
+}
+```
+&ensp;&ensp;&ensp;&ensp;实测，usb_stor_invoke_transport()函数当前长达319行，所以要解析起来还是蛮复杂的。但是在讲解之前，还得先介绍us->transport(srb, us)。
+
+##### 2.7.4.2 usb_stor_Bulk_transport()函数解析
+
+
 
 
 
@@ -1982,5 +2825,7 @@ static int usb_stor_msg_common(struct us_data *us, int timeout)
 
 
 ---
+
 [^sample_1]: 该段摘抄[蜗窝科技](http://www.wowotech.net/irq_subsystem/cmwq-intro.html)博客文章内某段内容。
-[^sample_2]: USB_Storage_spec.md手册解析文档中的[1.2.1.2](https://github.com/TGSP/USB-storage-knowledge/blob/master/USB_Storage_spec.md)小节。
+[^sample_2]: [USB_Storage_spec.md](https://github.com/TGSP/USB-storage-knowledge/blob/master/USB_Storage_spec.md)手册解析文档中的1.2.1.2小节。
+[^sample_3]:此处我也没看懂，是直接摘抄了《[Linux那些事儿之我是U盘](https://github.com/TGSP/USB-storage-knowledge/blob/master/Linux_stuff_am_I_a_USB_drive.pdf)》里面的，待后续学习SCSI架构了再来详细理解说明。
