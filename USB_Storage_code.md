@@ -2348,6 +2348,7 @@ standard INQUIRY:
 
 ######  2.7.3.1.2 fill_inquiry_response()函数解析 
 ==【data数据说明及填充】==
+
 &ensp;&ensp;&ensp;&ensp;继续fill_inquiry_response()，接下来的两句：
 ```C
 memset(data+8, ' ', 28);
@@ -2383,6 +2384,7 @@ memset(data+8, ' ', 28);
     - data_ptr[4]被赋值为0x1F，该字节被称为additional length，附加参数的长度，即除了用这么一个标准格式的数据响应之外，可能还会返回更多的一些信息；
     
 ==【usb_stor_set_xfer_buf()函数解析】==
+
 &ensp;&ensp;&ensp;&ensp;函数实现如下，正如英文注释，即存储该buffer内容到srb的transfer buffer中，并设置SCSI residue。
 
 ~~~C
@@ -2815,7 +2817,981 @@ Retry_Sense:
 &ensp;&ensp;&ensp;&ensp;实测，usb_stor_invoke_transport()函数当前长达319行，所以要解析起来还是蛮复杂的。但是在讲解之前，还得先介绍us->transport(srb, us)。
 
 ##### 2.7.4.2 usb_stor_Bulk_transport()函数解析
+&ensp;&ensp;&ensp;&ensp; 函数的实现如下：
+```C
+int usb_stor_Bulk_transport(struct scsi_cmnd *srb, struct us_data *us)
+{
+    struct bulk_cb_wrap *bcb = (struct bulk_cb_wrap *) us->iobuf;
+    struct bulk_cs_wrap *bcs = (struct bulk_cs_wrap *) us->iobuf;
+    unsigned int transfer_length = scsi_bufflen(srb);
+    unsigned int residue;
+    int result;
+    int fake_sense = 0;
+    unsigned int cswlen;
+    unsigned int cbwlen = US_BULK_CB_WRAP_LEN;
 
+    /* Take care of BULK32 devices; set extra byte to 0 */
+    if (unlikely(us->fflags & US_FL_BULK32)) {
+        cbwlen = 32;
+        us->iobuf[31] = 0;
+    }
+
+    /* set up the command wrapper */
+    bcb->Signature = cpu_to_le32(US_BULK_CB_SIGN);
+    bcb->DataTransferLength = cpu_to_le32(transfer_length);
+    bcb->Flags = srb->sc_data_direction == DMA_FROM_DEVICE ?
+        US_BULK_FLAG_IN : 0;
+    bcb->Tag = ++us->tag;
+    bcb->Lun = srb->device->lun;
+    if (us->fflags & US_FL_SCM_MULT_TARG)
+        bcb->Lun |= srb->device->id << 4;
+    bcb->Length = srb->cmd_len; 
+
+    /* copy the command payload */
+    memset(bcb->CDB, 0, sizeof(bcb->CDB));
+    memcpy(bcb->CDB, srb->cmnd, bcb->Length);
+
+    /* send it to out endpoint */
+    usb_stor_dbg(us, "Bulk Command S 0x%x T 0x%x L %d F %d Trg %d LUN %d CL %d\n",
+             le32_to_cpu(bcb->Signature), bcb->Tag,
+             le32_to_cpu(bcb->DataTransferLength), bcb->Flags,
+             (bcb->Lun >> 4), (bcb->Lun & 0x0F),
+             bcb->Length);
+    result = usb_stor_bulk_transfer_buf(us, us->send_bulk_pipe,
+                bcb, cbwlen, NULL);
+    usb_stor_dbg(us, "Bulk command transfer result=%d\n", result);
+    if (result != USB_STOR_XFER_GOOD)
+        return USB_STOR_TRANSPORT_ERROR;
+
+    /* DATA STAGE */
+    /* send/receive data payload, if there is any */
+
+    /*
+     * Some USB-IDE converter chips need a 100us delay between the
+     * command phase and the data phase.  Some devices need a little
+     * more than that, probably because of clock rate inaccuracies.
+     */
+    if (unlikely(us->fflags & US_FL_GO_SLOW))
+        usleep_range(125, 150);
+
+    if (transfer_length) {
+        unsigned int pipe = srb->sc_data_direction == DMA_FROM_DEVICE ?
+                us->recv_bulk_pipe : us->send_bulk_pipe;
+        result = usb_stor_bulk_srb(us, pipe, srb);
+        usb_stor_dbg(us, "Bulk data transfer result 0x%x\n", result);
+        if (result == USB_STOR_XFER_ERROR)
+            return USB_STOR_TRANSPORT_ERROR;
+
+        /*
+         * If the device tried to send back more data than the
+         * amount requested, the spec requires us to transfer
+         * the CSW anyway.  Since there's no point retrying the
+         * the command, we'll return fake sense data indicating
+         * Illegal Request, Invalid Field in CDB.
+         */
+        if (result == USB_STOR_XFER_LONG)
+            fake_sense = 1;
+
+        /*
+         * Sometimes a device will mistakenly skip the data phase
+         * and go directly to the status phase without sending a
+         * zero-length packet.  If we get a 13-byte response here,
+         * check whether it really is a CSW.
+         */
+        if (result == USB_STOR_XFER_SHORT &&
+                srb->sc_data_direction == DMA_FROM_DEVICE &&
+                transfer_length - scsi_get_resid(srb) ==
+                    US_BULK_CS_WRAP_LEN) {
+            struct scatterlist *sg = NULL;
+            unsigned int offset = 0;
+
+            if (usb_stor_access_xfer_buf((unsigned char *) bcs,
+                    US_BULK_CS_WRAP_LEN, srb, &sg,
+                    &offset, FROM_XFER_BUF) ==
+                        US_BULK_CS_WRAP_LEN &&
+                    bcs->Signature ==
+                        cpu_to_le32(US_BULK_CS_SIGN)) {
+                usb_stor_dbg(us, "Device skipped data phase\n");
+                scsi_set_resid(srb, transfer_length);
+                goto skipped_data_phase;
+            }
+        }
+    }
+
+    /*
+     * See flow chart on pg 15 of the Bulk Only Transport spec for
+     * an explanation of how this code works.
+     */
+
+    /* get CSW for device status */
+    usb_stor_dbg(us, "Attempting to get CSW...\n");
+    result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
+                bcs, US_BULK_CS_WRAP_LEN, &cswlen);
+
+    /*
+     * Some broken devices add unnecessary zero-length packets to the
+     * end of their data transfers.  Such packets show up as 0-length
+     * CSWs.  If we encounter such a thing, try to read the CSW again.
+     */
+    if (result == USB_STOR_XFER_SHORT && cswlen == 0) {
+        usb_stor_dbg(us, "Received 0-length CSW; retrying...\n");
+        result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
+                bcs, US_BULK_CS_WRAP_LEN, &cswlen);
+    }
+
+    /* did the attempt to read the CSW fail? */
+    if (result == USB_STOR_XFER_STALLED) {
+
+        /* get the status again */
+        usb_stor_dbg(us, "Attempting to get CSW (2nd try)...\n");
+        result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
+                bcs, US_BULK_CS_WRAP_LEN, NULL);
+    }
+
+    /* if we still have a failure at this point, we're in trouble */
+    usb_stor_dbg(us, "Bulk status result = %d\n", result);
+    if (result != USB_STOR_XFER_GOOD)
+        return USB_STOR_TRANSPORT_ERROR;
+
+ skipped_data_phase:
+    /* check bulk status */
+    residue = le32_to_cpu(bcs->Residue);
+    usb_stor_dbg(us, "Bulk Status S 0x%x T 0x%x R %u Stat 0x%x\n",
+             le32_to_cpu(bcs->Signature), bcs->Tag,
+             residue, bcs->Status);
+    if (!(bcs->Tag == us->tag || (us->fflags & US_FL_BULK_IGNORE_TAG)) ||
+        bcs->Status > US_BULK_STAT_PHASE) {
+        usb_stor_dbg(us, "Bulk logical error\n");
+        return USB_STOR_TRANSPORT_ERROR;
+    }
+
+    /*
+     * Some broken devices report odd signatures, so we do not check them
+     * for validity against the spec. We store the first one we see,
+     * and check subsequent transfers for validity against this signature.
+     */
+    if (!us->bcs_signature) {
+        us->bcs_signature = bcs->Signature;
+        if (us->bcs_signature != cpu_to_le32(US_BULK_CS_SIGN))
+            usb_stor_dbg(us, "Learnt BCS signature 0x%08X\n",
+                     le32_to_cpu(us->bcs_signature));
+    } else if (bcs->Signature != us->bcs_signature) {
+        usb_stor_dbg(us, "Signature mismatch: got %08X, expecting %08X\n",
+                 le32_to_cpu(bcs->Signature),
+                 le32_to_cpu(us->bcs_signature));
+        return USB_STOR_TRANSPORT_ERROR;
+    }
+
+    /*
+     * try to compute the actual residue, based on how much data
+     * was really transferred and what the device tells us
+     */
+    if (residue && !(us->fflags & US_FL_IGNORE_RESIDUE)) {
+
+        /*
+         * Heuristically detect devices that generate bogus residues
+         * by seeing what happens with INQUIRY and READ CAPACITY
+         * commands.
+         */
+        if (bcs->Status == US_BULK_STAT_OK &&
+                scsi_get_resid(srb) == 0 &&
+                    ((srb->cmnd[0] == INQUIRY &&
+                        transfer_length == 36) ||
+                    (srb->cmnd[0] == READ_CAPACITY &&
+                        transfer_length == 8))) {
+            us->fflags |= US_FL_IGNORE_RESIDUE;
+
+        } else {
+            residue = min(residue, transfer_length);
+            scsi_set_resid(srb, max(scsi_get_resid(srb),
+                                                   (int) residue));
+        }
+    }
+
+    /* based on the status code, we report good or bad */
+    switch (bcs->Status) {
+        case US_BULK_STAT_OK:
+            /* device babbled -- return fake sense data */
+            if (fake_sense) {
+                memcpy(srb->sense_buffer,
+                       usb_stor_sense_invalidCDB,
+                       sizeof(usb_stor_sense_invalidCDB));
+                return USB_STOR_TRANSPORT_NO_SENSE;
+            }
+
+            /* command good -- note that data could be short */
+            return USB_STOR_TRANSPORT_GOOD;
+
+        case US_BULK_STAT_FAIL:
+            /* command failed */
+            return USB_STOR_TRANSPORT_FAILED;
+
+        case US_BULK_STAT_PHASE:
+            /*
+             * phase error -- note that a transport reset will be
+             * invoked by the invoke_transport() function
+             */
+            return USB_STOR_TRANSPORT_ERROR;
+    }
+
+    /* we should never get here, but if we do, we're in trouble */
+    return USB_STOR_TRANSPORT_ERROR;
+}
+EXPORT_SYMBOL_GPL(usb_stor_Bulk_transport);
+```
+&ensp;&ensp;&ensp;&ensp;实测代码长218行，非常显然，usb_stor_Bulk_transport()和usb_stor_transparent_scsi_command()才是USB storage的主体核心；下面逐一进行分析；
+
+###### 2.7.4.2.1 函数变量分析
+&ensp;&ensp;&ensp;&ensp;函数实现了很多变量，代码如下：
+```C
+    struct bulk_cb_wrap *bcb = (struct bulk_cb_wrap *) us->iobuf;
+    struct bulk_cs_wrap *bcs = (struct bulk_cs_wrap *) us->iobuf;
+    unsigned int transfer_length = scsi_bufflen(srb);
+    unsigned int residue;
+    int result;
+    int fake_sense = 0;
+    unsigned int cswlen;
+    unsigned int cbwlen = US_BULK_CB_WRAP_LEN;
+```
+
+- struct bulk_cb_wrap结构体实例bcb；是BOT协议中对scsi cmd/data的封装结构，先看下该结构体：
+```C
+/* command block wrapper */
+struct bulk_cb_wrap {
+    __le32  Signature;      /* contains 'USBC' */
+    __u32   Tag;            /* unique per command id */
+    __le32  DataTransferLength; /* size of data */
+    __u8    Flags;          /* direction in bit 0 */
+    __u8    Lun;            /* LUN normally 0 */
+    __u8    Length;         /* length of the CDB */
+    __u8    CDB[16];        /* max command */
+};
+```
+&ensp;&ensp;&ensp;&ensp;这个结构体是和手册上定义的Command Block Wrapper (CBW)一模一样的；而us->iobuf是已经被申请了的DMA内存；
+
+- struct bulk_cs_wrap结构体实例bcs；是BOT协议中device传回的状态封装结构，现看下该结构体：
+```C
+/* command status wrapper */
+struct bulk_cs_wrap {
+    __le32  Signature;  /* contains 'USBS' */
+    __u32   Tag;        /* same as original command */
+    __le32  Residue;    /* amount not transferred */
+    __u8    Status;     /* see below */
+};
+```
+
+- transfer_length为本次传输cmd/data数据的长度；
+- residue为scsi剩余传输的数据；
+- fake_sense，某些错误处理时需要用到；
+- cswlen，device返回时的数据长度；
+- cbwlen，host下发的bcb长度，此处US_BULK_CB_WRAP_LEN宏定义为31字节；
+
+&ensp;&ensp;&ensp;&ensp;usb_stor_Bulk_transport()函数主要分了四个部分，摘取代码英文注释分为如下：
+
+- set up the command wrapper；
+- DATA STAGE
+- get CSW for device status；
+- check bulk status。
+
+&ensp;&ensp;&ensp;&ensp;接下来会逐一分小节介绍，在这之前，usb_stor_Bulk_transport()还有个unlikely的判断：
+```C
+    /* Take care of BULK32 devices; set extra byte to 0 */
+    if (unlikely(us->fflags & US_FL_BULK32)) {
+        cbwlen = 32;
+        us->iobuf[31] = 0;
+    }
+```
+&ensp;&ensp;&ensp;&ensp;即用于根据us->fflags的US_FL_BULK32标记，做出限定CBW的长度，这也是个特例。
+
+###### 2.7.4.2.2 set up the command wrapper
+==【填充CBW】==
+
+&ensp;&ensp;&ensp;&ensp;此部分，即优先发送一个SCSI命令，通过封装成CBW结构，即由bcb携带并发送给device：
+```C
+    /* set up the command wrapper */
+    bcb->Signature = cpu_to_le32(US_BULK_CB_SIGN);
+    bcb->DataTransferLength = cpu_to_le32(transfer_length);
+    bcb->Flags = srb->sc_data_direction == DMA_FROM_DEVICE ?
+        US_BULK_FLAG_IN : 0;
+    bcb->Tag = ++us->tag;
+    bcb->Lun = srb->device->lun;
+    if (us->fflags & US_FL_SCM_MULT_TARG)
+        bcb->Lun |= srb->device->id << 4;
+    bcb->Length = srb->cmd_len;
+
+    /* copy the command payload */
+    memset(bcb->CDB, 0, sizeof(bcb->CDB));
+    memcpy(bcb->CDB, srb->cmnd, bcb->Length);
+
+    /* send it to out endpoint */
+    usb_stor_dbg(us, "Bulk Command S 0x%x T 0x%x L %d F %d Trg %d LUN %d CL %d\n",
+             le32_to_cpu(bcb->Signature), bcb->Tag,
+             le32_to_cpu(bcb->DataTransferLength), bcb->Flags,
+             (bcb->Lun >> 4), (bcb->Lun & 0x0F),
+             bcb->Length);
+    result = usb_stor_bulk_transfer_buf(us, us->send_bulk_pipe,
+                bcb, cbwlen, NULL);
+    usb_stor_dbg(us, "Bulk command transfer result=%d\n", result);
+    if (result != USB_STOR_XFER_GOOD)
+        return USB_STOR_TRANSPORT_ERROR;
+```
+
+- 首先填充bcb结构体元素bcb->Signature、bcb->DataTransferLength、bcb->Flags、bcb->Tag、bcb->Lun、bcb->Length；
+    - bcb->Signature：US_BULK_CB_SIGN宏定义值为0x43425355，代表CBW；
+    - bcb->DataTransferLength：host希望传输的data字节长度，根据手册，所有的CBW和CSW都是little endian，所以此处得用cpu_to_le32()做了封装；
+    - bcb->Flags：此处是设置接下来的数据传输方向，即bit[[7] - 1表示从device到host；
+    - bcb->Tag：此处直接由us->tag赋值，Tag元素的释义是“unique per command id”，该值是用来识别匹配CBW与CSW之用；
+    - bcb->Lun：指定与哪一个lun通信，此处对于U盘来说意义不大；
+    - bcb->Length：cmd的长度，只能是1到16之间的数。
+    
+&ensp;&ensp;&ensp;&ensp;以上所涉及到的宏定义代码实现如下（包含上面部分宏定义）：
+```C
+#define US_BULK_CB_WRAP_LEN 31
+#define US_BULK_CB_SIGN     0x43425355  /* spells out 'USBC' */
+#define US_BULK_FLAG_IN     (1 << 7)
+#define US_BULK_FLAG_OUT    0
+```
+
+==【拷贝cmd命令数据】==
+
+&ensp;&ensp;&ensp;&ensp;将srb内携带的cmd数据填充到bcb封装中，此部分也是填充CBW结构：
+```C
+    /* copy the command payload */
+    memset(bcb->CDB, 0, sizeof(bcb->CDB));
+    memcpy(bcb->CDB, srb->cmnd, bcb->Length);
+```
+
+==【发送CBW】==
+&ensp;&ensp;&ensp;&ensp;使用usb_stor_bulk_transfer_buf()函数发送携带SCSI smd的CBW，代码实现如下：
+```C
+/*
+ * Transfer one buffer via bulk pipe, without timeouts, but allowing early
+ * termination.  Return codes are USB_STOR_XFER_xxx.  If the bulk pipe
+ * stalls during the transfer, the halt is automatically cleared.
+ */
+int usb_stor_bulk_transfer_buf(struct us_data *us, unsigned int pipe,
+    void *buf, unsigned int length, unsigned int *act_len)
+{
+    int result;
+    
+    usb_stor_dbg(us, "xfer %u bytes\n", length);
+    
+    /* fill and submit the URB */
+    usb_fill_bulk_urb(us->current_urb, us->pusb_dev, pipe, buf, length,
+              usb_stor_blocking_completion, NULL);
+    result = usb_stor_msg_common(us, 0);
+
+    /* store the actual length of the data transferred */
+    if (act_len)
+        *act_len = us->current_urb->actual_length;
+    return interpret_urb_result(us, pipe, length, result,
+            us->current_urb->actual_length);
+}
+EXPORT_SYMBOL_GPL(usb_stor_bulk_transfer_buf);
+```
+&ensp;&ensp;&ensp;&ensp;代码流程如下：
+
+- 使用usb_fill_bulk_urb()填充urb，赋值us->current_urb->complete = complete_fn；
+- 调用usb_stor_msg_common()初始化完成量urb_done，及使用usb_submit_urb()上报urb给USB HCD，并利用wait_for_completion_interruptible_timeout()等待处理结果；返回urb状态（该函数之前解析过，此处不继续）；
+- 利用interpret_urb_result()解析urb状态结果，该函数实现如下：
+
+---
+```C
+    return interpret_urb_result(us, pipe, length, result,
+            us->current_urb->actual_length);
+```
+```C
+/*
+ * Interpret the results of a URB transfer
+ *  
+ * This function prints appropriate debugging messages, clears halts on
+ * non-control endpoints, and translates the status to the corresponding
+ * USB_STOR_XFER_xxx return code.
+ */
+static int interpret_urb_result(struct us_data *us, unsigned int pipe,
+        unsigned int length, int result, unsigned int partial)
+{
+    usb_stor_dbg(us, "Status code %d; transferred %u/%u\n",
+             result, partial, length);
+    switch (result) {
+
+    /* no error code; did we send all the data? */
+    case 0:
+        if (partial != length) {
+            usb_stor_dbg(us, "-- short transfer\n");
+            return USB_STOR_XFER_SHORT;
+        }
+
+        usb_stor_dbg(us, "-- transfer complete\n");
+        return USB_STOR_XFER_GOOD;
+
+    /* stalled */
+    case -EPIPE:
+        /*
+         * for control endpoints, (used by CB[I]) a stall indicates
+         * a failed command
+         */
+        if (usb_pipecontrol(pipe)) {
+            usb_stor_dbg(us, "-- stall on control pipe\n");
+            return USB_STOR_XFER_STALLED;
+        }
+
+        /* for other sorts of endpoint, clear the stall */
+        usb_stor_dbg(us, "clearing endpoint halt for pipe 0x%x\n",
+                 pipe);
+        if (usb_stor_clear_halt(us, pipe) < 0)
+            return USB_STOR_XFER_ERROR;
+        return USB_STOR_XFER_STALLED;
+
+    /* babble - the device tried to send more than we wanted to read */
+    case -EOVERFLOW:
+        usb_stor_dbg(us, "-- babble\n");
+        return USB_STOR_XFER_LONG;
+
+    /* the transfer was cancelled by abort, disconnect, or timeout */
+    case -ECONNRESET:
+        usb_stor_dbg(us, "-- transfer cancelled\n");
+        return USB_STOR_XFER_ERROR;
+
+    /* short scatter-gather read transfer */
+    case -EREMOTEIO:
+        usb_stor_dbg(us, "-- short read transfer\n");
+        return USB_STOR_XFER_SHORT;
+
+    /* abort or disconnect in progress */
+    case -EIO:
+        usb_stor_dbg(us, "-- abort or disconnect in progress\n");
+        return USB_STOR_XFER_ERROR;
+
+    /* the catch-all error case */
+    default:
+        usb_stor_dbg(us, "-- unknown error\n");
+        return USB_STOR_XFER_ERROR;
+    }
+}
+```
+&ensp;&ensp;&ensp;&ensp;针对不同的urb返回状态，返回不同的宏定义标记，宏定义实现如下：
+```C
+/*
+ * usb_stor_bulk_transfer_xxx() return codes, in order of severity
+ */
+
+#define USB_STOR_XFER_GOOD  0   /* good transfer                 */
+#define USB_STOR_XFER_SHORT 1   /* transferred less than expected */
+#define USB_STOR_XFER_STALLED   2   /* endpoint stalled              */
+#define USB_STOR_XFER_LONG  3   /* device tried to send too much */
+#define USB_STOR_XFER_ERROR 4   /* transfer died in the middle   */
+```
+
+---
+
+==【结果检查】==
+
+&ensp;&ensp;&ensp;&ensp;发送完CBW后，此处检查发送urb的状态，即本次USB传输是否成功，若不成功，也就没必须继续了。
+```C
+    usb_stor_dbg(us, "Bulk command transfer result=%d\n", result);
+    if (result != USB_STOR_XFER_GOOD)
+        return USB_STOR_TRANSPORT_ERROR;
+```
+###### 2.7.4.2.3 DATA STAGE
+&ensp;&ensp;&ensp;&ensp;先对us->fflags的US_FL_GO_SLOW进行检测，函数解析如下：
+```C
+    /*
+     * Some USB-IDE converter chips need a 100us delay between the
+     * command phase and the data phase.  Some devices need a little
+     * more than that, probably because of clock rate inaccuracies.
+     */
+    if (unlikely(us->fflags & US_FL_GO_SLOW))
+        usleep_range(125, 150);
+```
+&ensp;&ensp;&ensp;&ensp;然后针对有中间数据传输的情况进行数据的传送，代码实现如下：
+```C
+    if (transfer_length) {
+        unsigned int pipe = srb->sc_data_direction == DMA_FROM_DEVICE ?
+                us->recv_bulk_pipe : us->send_bulk_pipe;
+        result = usb_stor_bulk_srb(us, pipe, srb);
+        usb_stor_dbg(us, "Bulk data transfer result 0x%x\n", result);
+        if (result == USB_STOR_XFER_ERROR)
+            return USB_STOR_TRANSPORT_ERROR;
+
+        /*
+         * If the device tried to send back more data than the
+         * amount requested, the spec requires us to transfer
+         * the CSW anyway.  Since there's no point retrying the
+         * the command, we'll return fake sense data indicating
+         * Illegal Request, Invalid Field in CDB.
+         */
+        if (result == USB_STOR_XFER_LONG)
+            fake_sense = 1;
+
+        /*
+         * Sometimes a device will mistakenly skip the data phase
+         * and go directly to the status phase without sending a
+         * zero-length packet.  If we get a 13-byte response here,
+         * check whether it really is a CSW.
+         */
+        if (result == USB_STOR_XFER_SHORT &&
+                srb->sc_data_direction == DMA_FROM_DEVICE &&
+                transfer_length - scsi_get_resid(srb) ==
+                    US_BULK_CS_WRAP_LEN) {
+            struct scatterlist *sg = NULL;
+            unsigned int offset = 0;
+
+            if (usb_stor_access_xfer_buf((unsigned char *) bcs,
+                    US_BULK_CS_WRAP_LEN, srb, &sg,
+                    &offset, FROM_XFER_BUF) ==
+                        US_BULK_CS_WRAP_LEN &&
+                    bcs->Signature ==
+                        cpu_to_le32(US_BULK_CS_SIGN)) {
+                usb_stor_dbg(us, "Device skipped data phase\n");
+                scsi_set_resid(srb, transfer_length);
+                goto skipped_data_phase;
+            }
+        }
+    }
+```
+&ensp;&ensp;&ensp;&ensp;下面解析代码流程：
+
+- 通过srb->sc_data_direction获取对应方向bulk pipe；
+- 使用usb_stor_bulk_srb()做数据传输，此部分在2.7.4.2.4小节解析：
+
+###### 2.7.4.2.4 usb_stor_bulk_transfer_sglist()函数解析
+```C
+/*
+ * Common used function. Transfer a complete command
+ * via usb_stor_bulk_transfer_sglist() above. Set cmnd resid
+ */
+int usb_stor_bulk_srb(struct us_data* us, unsigned int pipe,
+              struct scsi_cmnd* srb)
+{
+    unsigned int partial;
+    int result = usb_stor_bulk_transfer_sglist(us, pipe, scsi_sglist(srb),
+                      scsi_sg_count(srb), scsi_bufflen(srb),
+                      &partial);
+
+    scsi_set_resid(srb, scsi_bufflen(srb) - partial);
+    return result; 
+}
+EXPORT_SYMBOL_GPL(usb_stor_bulk_srb);
+```
+```C
+/*
+ * Transfer a scatter-gather list via bulk transfer
+ *
+ * This function does basically the same thing as usb_stor_bulk_transfer_buf()
+ * above, but it uses the usbcore scatter-gather library.
+ */
+static int usb_stor_bulk_transfer_sglist(struct us_data *us, unsigned int pipe,
+        struct scatterlist *sg, int num_sg, unsigned int length,
+        unsigned int *act_len)
+{
+    int result;
+
+    /* don't submit s-g requests during abort processing */
+    if (test_bit(US_FLIDX_ABORTING, &us->dflags))
+        return USB_STOR_XFER_ERROR;
+
+    /* initialize the scatter-gather request block */
+    usb_stor_dbg(us, "xfer %u bytes, %d entries\n", length, num_sg);
+    result = usb_sg_init(&us->current_sg, us->pusb_dev, pipe, 0,
+            sg, num_sg, length, GFP_NOIO);
+    if (result) {
+        usb_stor_dbg(us, "usb_sg_init returned %d\n", result);
+        return USB_STOR_XFER_ERROR;
+    }
+    
+    /*
+     * since the block has been initialized successfully, it's now
+     * okay to cancel it
+     */
+    set_bit(US_FLIDX_SG_ACTIVE, &us->dflags);
+
+    /* did an abort occur during the submission? */
+    if (test_bit(US_FLIDX_ABORTING, &us->dflags)) {
+
+        /* cancel the request, if it hasn't been cancelled already */
+        if (test_and_clear_bit(US_FLIDX_SG_ACTIVE, &us->dflags)) {
+            usb_stor_dbg(us, "-- cancelling sg request\n");
+            usb_sg_cancel(&us->current_sg);
+        }
+    }
+
+    /* wait for the completion of the transfer */
+    usb_sg_wait(&us->current_sg);
+    clear_bit(US_FLIDX_SG_ACTIVE, &us->dflags);
+
+    result = us->current_sg.status;
+    if (act_len)
+        *act_len = us->current_sg.bytes;
+    return interpret_urb_result(us, pipe, length, result,
+            us->current_sg.bytes);
+}
+```
+&ensp;&ensp;&ensp;&ensp;直接看usb_stor_bulk_transfer_sglist()函数实现，此处注释已讲解明了，通过bulk pipe传输scatter-gather列表；此处调用了USB core层的scatter-gather库实现；
+
+&ensp;&ensp;&ensp;&ensp;进函数即检测us->dflags的US_FLIDX_ABORTING标记，确认当前USB  storage未出错；
+
+&ensp;&ensp;&ensp;&ensp;下面得着重介绍下scatter-gather库的实现，现看函数usb_sg_init()，查看该函数第一个参数：us->current_sg，这是一个struct usb_sg_request结构体元素，长得和us->current_urb差不多，摘抄struct us_data结构体内这部分元素定义：
+```C
+    /* control and bulk communications data */
+    struct urb      *current_urb;    /* USB requests     */
+    struct usb_ctrlrequest  *cr;         /* control requests     */
+    struct usb_sg_request   current_sg;  /* scatter-gather req.  */
+```
+&ensp;&ensp;&ensp;&ensp;此部分即，当传输scsi cmd时，因为数据量少，所以使用了urb request；此处会做大数据量传输，所以使用scatter-gather request；对于每次 urb 请求，我们所作的只是申请一个结构体变量或者说申请指针然后申请内存，第二步就是提交 urb，即调用 usb_submit_urb()，剩下的事情 usb core 就会去帮我们处理了，Linux 中的模块机制酷就酷在这里，每个模块都给别人服务，也同时享受着别人提供的服务。同样对于 sg request,usb core 也实现了这些，我们只需要申请并初始化一个 struct usb_sg_request 的结构体，然后提交，然后 usb core 那边自然就知道该怎么处理了。查看struct usb_sg_request结构体实现：
+```C
+/** 
+ * struct usb_sg_request - support for scatter/gather I/O
+ * @status: zero indicates success, else negative errno
+ * @bytes: counts bytes transferred.
+ *
+ * These requests are initialized using usb_sg_init(), and then are used
+ * as request handles passed to usb_sg_wait() or usb_sg_cancel().  Most
+ * members of the request object aren't for driver access.
+ *  
+ * The status and bytecount values are valid only after usb_sg_wait()
+ * returns.  If the status is zero, then the bytecount matches the total
+ * from the request.
+ *  
+ * After an error completion, drivers may need to clear a halt condition
+ * on the endpoint.
+ */
+struct usb_sg_request {
+    int         status;
+    size_t          bytes;
+
+    /* private:
+     * members below are private to usbcore,
+     * and are not provided for driver access!
+     */
+    spinlock_t      lock;
+
+    struct usb_device   *dev;
+    int         pipe;
+
+    int         entries;
+    struct urb      **urbs;
+
+    int         count;
+    struct completion   complete;
+};
+```
+&ensp;&ensp;&ensp;&ensp;整个 usb 系统都会使用这个数据结构，如果我们希望使用 scatter-gather 方式的话。usb core 已经为我们准备好了数据结构和相应的函数，我们只需要调用即可。一共有三个函数，她们是usb_sg_init()，usb_sg_wait()，usb_sg_cancel()。我们要提交一个 sg 请求，需要做的是，先用 usb_sg_init 来初始化请求，然后 usb_sg_wait()正式提交，然后我们该做的就都做了。如果想撤销一个 sg 请求，那么调用usb_sg_cancel 即可。
+
+&ensp;&ensp;&ensp;&ensp;分析一下usb_sg_init()的参数：
+
+- us->current_sg：使用us->current_sg指示一个scatter-gather request；
+- us->pusb_dev：指示是USB device要发送/接收数据；
+- pipe：传输pipe，此处是send/recv bulk pipe；
+- 0：查看usb_sg_init()参数定义为interrupt端点的轮询速率，即interval，因为BOT用的是bulk传输，所以此处直接指定为0；
+- sg：需要传输的sg数组；
+- num_sg：sg数组个数；
+- length：本次希望传输的数据长度；
+- GFP_NOIO：意思就是不能在申请内存的时候进行IO操作。这个和usb_submit_urb(us->current_urb, GFP_NOIO)的标志一样。
+
+&ensp;&ensp;&ensp;&ensp;继续分析：
+
+- 在提交us->current_sg后，设置us->dflags标记US_FLIDX_SG_ACTIVE；这和调用usb_submit_urb()之后一样的设定；
+- 再次检测us->dflags的US_FLIDX_ABORTING标记；如果以报错，则检测并清除us->dflags的US_FLIDX_SG_ACTIVE标记；
+- 调用usb_sg_wait(&us->current_sg)等待传输处理完成；
+- 清除us->dflags的US_FLIDX_SG_ACTIVE标记，标示已用完该功能；
+- 获取本次的传输状态us->current_sg.status，如果定义了act_len变量，即实际传输数据长度，则赋值us->current_sg.bytes，这里面保存了实际传输的长度；
+- 调用interpret_urb_result()对结果做检测判定，（前面已经解析过）；
+
+&ensp;&ensp;&ensp;&ensp;回到usb_stor_bulk_srb()函数，再用scsi_set_resid设置未传输完的字节数；
+
+&ensp;&ensp;&ensp;&ensp;回到usb_stor_Bulk_transport()，检测本次的传输结果状态：
+
+- 如果result为USB_STOR_XFER_ERROR，则直接返回错误，无法继续了；
+- 如果result为USB_STOR_XFER_LONG，则设定fake_sense为1，此处可以在interpret_urb_result()中获得解释：
+```C
+    /* babble - the device tried to send more than we wanted to read */
+    case -EOVERFLOW:
+        usb_stor_dbg(us, "-- babble\n");
+        return USB_STOR_XFER_LONG;
+```
+&ensp;&ensp;&ensp;&ensp;即在从device读模式时，device发的数据大于host想要读取的，后面再解析fake_sense不为0的处理；
+- 还有一个特例，即如果result为USB_STOR_XFER_SHORT时，需要做进一步判断，代码实现如下：
+
+---
+==【skipped_data_phase判断】==
+```C
+        /*
+         * Sometimes a device will mistakenly skip the data phase
+         * and go directly to the status phase without sending a
+         * zero-length packet.  If we get a 13-byte response here,
+         * check whether it really is a CSW.
+         */
+        if (result == USB_STOR_XFER_SHORT &&
+                srb->sc_data_direction == DMA_FROM_DEVICE &&
+                transfer_length - scsi_get_resid(srb) ==
+                    US_BULK_CS_WRAP_LEN) {
+            struct scatterlist *sg = NULL;
+            unsigned int offset = 0;
+
+            if (usb_stor_access_xfer_buf((unsigned char *) bcs,
+                    US_BULK_CS_WRAP_LEN, srb, &sg,
+                    &offset, FROM_XFER_BUF) ==
+                        US_BULK_CS_WRAP_LEN &&
+                    bcs->Signature ==
+                        cpu_to_le32(US_BULK_CS_SIGN)) {
+                usb_stor_dbg(us, "Device skipped data phase\n");
+                scsi_set_resid(srb, transfer_length);
+                goto skipped_data_phase;
+            }
+        }
+
+```
+&ensp;&ensp;&ensp;&ensp;注释上说，有些device会犯错误，直接跳过了data环节，直接传回CSW状态，这个时候USB storage驱动就得判断分析以下了。
+
+- result == USB_STOR_XFER_SHORT的地方就两个，这个可从interpret_urb_result()得到，一个是实际数据传输长度不等于host预期传输的数据长度；另一个是-EREMOTEIO错误；
+- 判断srb->sc_data_direction方向，若是从device到host，则继续下一步；
+- transfer_length - scsi_get_resid(srb) == US_BULK_CS_WRAP_LEN：这一步看了半天，才看懂，给出下列代码：
+```C
+#define US_BULK_CS_WRAP_LEN 13
+
+unsigned int transfer_length = scsi_bufflen(srb);
+
+static inline int scsi_get_resid(struct scsi_cmnd *cmd)
+{
+    return cmd->sdb.resid;
+}
+
+static inline void scsi_set_resid(struct scsi_cmnd *cmd, int resid)
+{
+    cmd->sdb.resid = resid;
+}
+
+scsi_set_resid(srb, scsi_bufflen(srb) - partial);
+```
+&ensp;&ensp;&ensp;&ensp;主要还是各个实现太分散，顾此忘彼，USB storage驱动在传输完一次sg后，partial为实际的传输长度；transfer_length则是host希望传输/接收的数据长度；所以对于DMA_FROM_DEVICE这种情况，此处的transfer_length - scsi_get_resid(srb)即是这个partial的值。而如果partial等于了US_BULK_CS_WRAP_LEN，即13字节，则需要再做下判断，是data数据就是13字节，还是device误操作把CSW给提前传上来了，而没有穿个0长度包。
+
+&ensp;&ensp;&ensp;&ensp;继续代码
+
+- 使用usb_stor_access_xfer_buf()函数从srb的transfer buffer中取出US_BULK_CS_WRAP_LEN长度的数据（bcs本来就只有13字节的数据嘛），并赋值到bcs中；
+- 如果取到的数据确实等于US_BULK_CS_WRAP_LEN，则继续；
+- 确认bcs->Signature的数值是不是US_BULK_CS_SIGN，根据手册，得用cpu_to_le32()转换一下，如果正确，则铁定CSW无疑；
+- 重新调用scsi_set_resid()设置，并使用goto语言跳到后面skipped_data_phase段，后续再讲解；
+
+---
+
+###### 2.7.4.2.5 get CSW for device status
+&ensp;&ensp;&ensp;&ensp;手册第15页的流程图对此部分代码做了解析，再次贴出该流程和接下来的代码部分如下：
+
+![](images/status_Transport_Flow.png)
+
+```C
+    /*
+     * See flow chart on pg 15 of the Bulk Only Transport spec for
+     * an explanation of how this code works.
+     */
+
+    /* get CSW for device status */
+    usb_stor_dbg(us, "Attempting to get CSW...\n");
+    result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
+                bcs, US_BULK_CS_WRAP_LEN, &cswlen);
+
+    /*
+     * Some broken devices add unnecessary zero-length packets to the
+     * end of their data transfers.  Such packets show up as 0-length
+     * CSWs.  If we encounter such a thing, try to read the CSW again.
+     */
+    if (result == USB_STOR_XFER_SHORT && cswlen == 0) {
+        usb_stor_dbg(us, "Received 0-length CSW; retrying...\n");
+        result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
+                bcs, US_BULK_CS_WRAP_LEN, &cswlen);
+    }
+
+    /* did the attempt to read the CSW fail? */
+    if (result == USB_STOR_XFER_STALLED) {
+
+        /* get the status again */
+        usb_stor_dbg(us, "Attempting to get CSW (2nd try)...\n");
+        result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
+                bcs, US_BULK_CS_WRAP_LEN, NULL);
+    }
+
+    /* if we still have a failure at this point, we're in trouble */
+    usb_stor_dbg(us, "Bulk status result = %d\n", result);
+    if (result != USB_STOR_XFER_GOOD)
+        return USB_STOR_TRANSPORT_ERROR;
+...
+```
+下面根据流程图来逐步解析代码：
+
+- 使用usb_stor_bulk_transfer_buf()获取CSW，此处用的是urb request，各函数之前已解析过，代码实现如下：
+```C
+/*
+ * Transfer one buffer via bulk pipe, without timeouts, but allowing early
+ * termination.  Return codes are USB_STOR_XFER_xxx.  If the bulk pipe
+ * stalls during the transfer, the halt is automatically cleared.
+ */
+int usb_stor_bulk_transfer_buf(struct us_data *us, unsigned int pipe,
+    void *buf, unsigned int length, unsigned int *act_len)
+{
+    int result;
+
+    usb_stor_dbg(us, "xfer %u bytes\n", length);
+
+    /* fill and submit the URB */
+    usb_fill_bulk_urb(us->current_urb, us->pusb_dev, pipe, buf, length,
+              usb_stor_blocking_completion, NULL);
+    result = usb_stor_msg_common(us, 0);
+
+    /* store the actual length of the data transferred */
+    if (act_len)
+        *act_len = us->current_urb->actual_length;
+    return interpret_urb_result(us, pipe, length, result,
+            us->current_urb->actual_length);
+}
+EXPORT_SYMBOL_GPL(usb_stor_bulk_transfer_buf);
+```
+&ensp;&ensp;&ensp;&ensp;继续将传输结果赋给result；
+
+- 一种特例。某些device会在data传输阶段完成后，还发一个多余的0长度包，如果是，则再重新读取一次CSW；
+```C
+    /*
+     * Some broken devices add unnecessary zero-length packets to the
+     * end of their data transfers.  Such packets show up as 0-length
+     * CSWs.  If we encounter such a thing, try to read the CSW again.
+     */
+    if (result == USB_STOR_XFER_SHORT && cswlen == 0) {
+        usb_stor_dbg(us, "Received 0-length CSW; retrying...\n");
+        result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
+                bcs, US_BULK_CS_WRAP_LEN, &cswlen);
+    }
+```
+
+- 如果result为USB_STOR_XFER_STALLED，继续重读一次CSW；
+```C
+    /* did the attempt to read the CSW fail? */
+    if (result == USB_STOR_XFER_STALLED) {
+
+        /* get the status again */
+        usb_stor_dbg(us, "Attempting to get CSW (2nd try)...\n");
+        result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
+                bcs, US_BULK_CS_WRAP_LEN, NULL);
+    }
+```
+
+- 如果二次读CSW还是出错，则该开始检测错误了；
+```C
+    /* if we still have a failure at this point, we're in trouble */
+    usb_stor_dbg(us, "Bulk status result = %d\n", result);
+    if (result != USB_STOR_XFER_GOOD)
+        return USB_STOR_TRANSPORT_ERROR;
+```
+
+###### 2.7.4.2.5 check bulk status
+&ensp;&ensp;&ensp;&ensp;特别将状态检测做一小节来解析；
+
+- 先拿到bcs的residue：le32_to_cpu(bcs->Residue)；
+- 判断一下有没有逻辑错误：即bcs->Tag与之前的bcb->Tag是否相等；us->fflags有没有设置US_FL_BULK_IGNORE_TAG标记；bcs->Status的值是否大于US_BULK_STAT_PHASE，即0x02；
+```C
+    if (!(bcs->Tag == us->tag || (us->fflags & US_FL_BULK_IGNORE_TAG)) ||
+        bcs->Status > US_BULK_STAT_PHASE) {
+        usb_stor_dbg(us, "Bulk logical error\n");
+        return USB_STOR_TRANSPORT_ERROR;
+    }
+```
+&ensp;&ensp;&ensp;&ensp;此处只有在bcs->Tag等于bcb->Tag；us->fflags没有设置US_FL_BULK_IGNORE_TAG标记；bcs->Status小于等于US_BULK_STAT_PHASE时才不会进if语句；
+
+- 对于某些broken devices会上报一个odd（古怪的）signatures，所以此处没有硬性按照spec来规划代码，而是在第一次传输时记下bcs->Signature，赋值给us->bcs_signature，然后在之后的传输中就只和us->bcs_signature比较即可，不同，则表示Signature mismatch；
+```C
+    /*
+     * Some broken devices report odd signatures, so we do not check them
+     * for validity against the spec. We store the first one we see,
+     * and check subsequent transfers for validity against this signature.
+     */
+    if (!us->bcs_signature) {
+        us->bcs_signature = bcs->Signature;
+        if (us->bcs_signature != cpu_to_le32(US_BULK_CS_SIGN))
+            usb_stor_dbg(us, "Learnt BCS signature 0x%08X\n",
+                     le32_to_cpu(us->bcs_signature));
+    } else if (bcs->Signature != us->bcs_signature) {
+        usb_stor_dbg(us, "Signature mismatch: got %08X, expecting %08X\n",
+                 le32_to_cpu(bcs->Signature),
+                 le32_to_cpu(us->bcs_signature));
+        return USB_STOR_TRANSPORT_ERROR;
+    }
+```
+
+- 计算精确的residue值；（此处不是很理解，后续再更新；）
+```C
+    /*
+     * try to compute the actual residue, based on how much data
+     * was really transferred and what the device tells us
+     */
+    if (residue && !(us->fflags & US_FL_IGNORE_RESIDUE)) {
+
+        /*
+         * Heuristically detect devices that generate bogus residues
+         * by seeing what happens with INQUIRY and READ CAPACITY
+         * commands.
+         */
+        if (bcs->Status == US_BULK_STAT_OK &&
+                scsi_get_resid(srb) == 0 &&
+                    ((srb->cmnd[0] == INQUIRY &&
+                        transfer_length == 36) ||
+                    (srb->cmnd[0] == READ_CAPACITY &&
+                        transfer_length == 8))) {
+            us->fflags |= US_FL_IGNORE_RESIDUE;
+
+        } else {
+            residue = min(residue, transfer_length);
+            scsi_set_resid(srb, max(scsi_get_resid(srb),
+                                                   (int) residue));
+        }
+    }
+```
+- 通过bcs->Status值，返回不同的处理结果；
+```C
+    /* based on the status code, we report good or bad */
+    switch (bcs->Status) {
+        case US_BULK_STAT_OK:
+            /* device babbled -- return fake sense data */
+            if (fake_sense) {
+                memcpy(srb->sense_buffer,
+                       usb_stor_sense_invalidCDB,
+                       sizeof(usb_stor_sense_invalidCDB));
+                return USB_STOR_TRANSPORT_NO_SENSE;
+            }
+
+            /* command good -- note that data could be short */
+            return USB_STOR_TRANSPORT_GOOD;
+
+        case US_BULK_STAT_FAIL:
+            /* command failed */
+            return USB_STOR_TRANSPORT_FAILED;
+
+        case US_BULK_STAT_PHASE:
+            /*
+             * phase error -- note that a transport reset will be
+             * invoked by the invoke_transport() function
+             */
+            return USB_STOR_TRANSPORT_ERROR;
+    }
+```
+&ensp;&ensp;&ensp;&ensp;CSW返回的bCSWStatus段，只会有四种状态：
+
+Value | Description
+--|--
+00h|Command Passed ("good status")
+01h|Command Failed
+02h|Phase Error
+03h and 04h|Reserved (Obsolete)
+05h to FFh|Reserved
+
+&ensp;&ensp;&ensp;&ensp;其中大于02h的情况yijing被拦截，所以此处只需要讨论前面三种状态了。
+
+- 最后，为了代码的严谨，在usb_stor_Bulk_transport()函数最末尾还加了一句无条件返回，当然，除非特殊中的特殊，代码一般不会执行到那里。
+```C
+    /* we should never get here, but if we do, we're in trouble */
+    return USB_STOR_TRANSPORT_ERROR;
+```
+
+---
+&ensp;&ensp;&ensp;&ensp;至此，usb_stor_Bulk_transport()函数解析完成；回到usb_stor_transparent_scsi_command()继续跟进。
 
 
 
