@@ -3682,7 +3682,7 @@ EXPORT_SYMBOL_GPL(usb_stor_bulk_transfer_buf);
         return USB_STOR_TRANSPORT_ERROR;
 ```
 
-###### 2.7.4.2.5 check bulk status
+###### 2.7.4.2.6 check bulk status
 &ensp;&ensp;&ensp;&ensp;特别将状态检测做一小节来解析；
 
 - 先拿到bcs的residue：le32_to_cpu(bcs->Residue)；
@@ -3782,7 +3782,39 @@ Value | Description
 03h and 04h|Reserved (Obsolete)
 05h to FFh|Reserved
 
-&ensp;&ensp;&ensp;&ensp;其中大于02h的情况yijing被拦截，所以此处只需要讨论前面三种状态了。
+&ensp;&ensp;&ensp;&ensp;其中大于02h的情况已经被拦截，所以此处只需要讨论前面三种状态了；另外在bcs->Status的US_BULK_STAT_OK下，还存在一种fake_sense=1的可能，即在data阶段从device读数据时，device多发了数据给host，此处定义device babbled，用fake_sense表示，当是这种情况时，需要返回给host一个封装好的无效cdb命令结果。所以就在此处捏造一个处理结果：
+```C
+        case US_BULK_STAT_OK:
+            /* device babbled -- return fake sense data */
+            if (fake_sense) {
+                memcpy(srb->sense_buffer,
+                       usb_stor_sense_invalidCDB,
+                       sizeof(usb_stor_sense_invalidCDB));
+                return USB_STOR_TRANSPORT_NO_SENSE;
+            }
+```
+&ensp;&ensp;&ensp;&ensp;其中usb_stor_sense_invalidCDB()结构定义在drivers/usb/storage/scsiglue.c中，实现如下：
+```C
+/* To Report "Illegal Request: Invalid Field in CDB */
+unsigned char usb_stor_sense_invalidCDB[18] = {
+    [0] = 0x70,             /* current error */
+    [2] = ILLEGAL_REQUEST,      /* Illegal Request = 0x05 */
+    [7] = 0x0a,             /* additional length */
+    [12]    = 0x24              /* Invalid Field in CDB */
+};
+EXPORT_SYMBOL_GPL(usb_stor_sense_invalidCDB);
+```
+&ensp;&ensp;&ensp;&ensp;这是一个字符数组，共18个元素，初始化的时候其中4个元素被赋值。这个结构是按照SCSI协议的sense data的格式来定义的，原理则是如果一个设备接收到一个Request Sense命令，那么它将按规则返回一个sense data。
+
+&ensp;&ensp;&ensp;&ensp;此处的意思是将usb_stor_sense_invalidCDB数组拷贝给srb->sense_buffer，然后返回USB_STOR_TRANSPORT_NO_SENSE结果，struct scsi_cmnd结构体内对sense_buffer元素的定义及解释如下：
+```C
+#define SCSI_SENSE_BUFFERSIZE   96
+    unsigned char *sense_buffer;
+                /* obtained by REQUEST SENSE when
+                 * CHECK CONDITION is received on original
+                 * command (auto-sense) */
+```
+&ensp;&ensp;&ensp;&ensp;SCSI协议里面规定了，当一个SCSI命令执行出了错，可以再发送一个REQUEST SENSE命令给目标device，然后它会返回一些信息，即sense data，而这部分逻辑被放在了底层驱动中来实现，因为某些scsi host卡可以自动发送REQUEST SENSE命令去了解详情，所以为了统一，就让内核底层驱动来判断了。这个即后续的need_auto_sense变量。
 
 - 最后，为了代码的严谨，在usb_stor_Bulk_transport()函数最末尾还加了一句无条件返回，当然，除非特殊中的特殊，代码一般不会执行到那里。
 ```C
@@ -3793,10 +3825,667 @@ Value | Description
 ---
 &ensp;&ensp;&ensp;&ensp;至此，usb_stor_Bulk_transport()函数解析完成；回到usb_stor_transparent_scsi_command()继续跟进。
 
+##### 2.7.4.3 usb_stor_invoke_transport()函数分析
+&ensp;&ensp;&ensp;&ensp;usb_stor_transparent_scsi_command()直接封装了usb_stor_invoke_transport()；上一小节介绍了usb_stor_invoke_transport()函数中的us->transport(srb, us)实现过程；现在继续分小段来跟踪代码：
+
+###### 2.7.4.3.1 result结果分析
+```C
+    result = us->transport(srb, us);
+
+    /*
+     * if the command gets aborted by the higher layers, we need to
+     * short-circuit all other processing
+     */
+    if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
+        usb_stor_dbg(us, "-- command was aborted\n");
+        srb->result = DID_ABORT << 16;
+        goto Handle_Errors;
+    }
+
+    /* if there is a transport error, reset and don't auto-sense */
+    if (result == USB_STOR_TRANSPORT_ERROR) {
+        usb_stor_dbg(us, "-- transport indicates error, resetting\n");
+        srb->result = DID_ERROR << 16;
+        goto Handle_Errors;
+    }
+
+    /* if the transport provided its own sense data, don't auto-sense */
+    if (result == USB_STOR_TRANSPORT_NO_SENSE) {
+        srb->result = SAM_STAT_CHECK_CONDITION;
+        last_sector_hacks(us, srb);
+        return;
+    }
+
+    srb->result = SAM_STAT_GOOD;
+```
+&ensp;&ensp;&ensp;&ensp;result结果是从us->transport(srb, us)返回的，它只会返回四个结果：USB_STOR_TRANSPORT_NO_SENSE、USB_STOR_TRANSPORT_GOOD、USB_STOR_TRANSPORT_FAILED、USB_STOR_TRANSPORT_ERROR。
+
+- 首先检查us->dflags的US_FLIDX_TIMED_OUT标记；
+- 继而检查result的USB_STOR_TRANSPORT_ERROR情况，如果传输错误，则进入Handle_Errors流程，直接reset；
+- result的USB_STOR_TRANSPORT_NO_SENSE情况，设置srb->result为SAM_STAT_CHECK_CONDITION，SCSI规范中定义的状态码，表明有sense data被放置在相应的buffer里，SCSI core层就会去读sense buffer。last_sector_hacks()函数是解决最后扇页相关BUG的，与此处的USB storage无关（主要是目前结合USB storage还看不懂该函数实现）；
+- 先默认给srb->result赋值SAM_STAT_GOOD；
+
+###### 2.7.4.3.2 result和need_auto_sense联合分析
+&ensp;&ensp;&ensp;&ensp;need_auto_sense变量是用来进一步确认是否需要发送REQUEST SENSE命令给device。此处是在判断是否需要设置该参数：
+```C
+    /*
+     * Determine if we need to auto-sense
+     *
+     * I normally don't use a flag like this, but it's almost impossible
+     * to understand what's going on here if I don't.
+     */
+    need_auto_sense = 0;
+
+    /*
+     * If we're running the CB transport, which is incapable
+     * of determining status on its own, we will auto-sense
+     * unless the operation involved a data-in transfer.  Devices
+     * can signal most data-in errors by stalling the bulk-in pipe.
+     */
+    if ((us->protocol == USB_PR_CB || us->protocol == USB_PR_DPCM_USB) &&
+            srb->sc_data_direction != DMA_FROM_DEVICE) {
+        usb_stor_dbg(us, "-- CB transport device requiring auto-sense\n");
+        need_auto_sense = 1;
+    }
+
+    /*
+     * If we have a failure, we're going to do a REQUEST_SENSE 
+     * automatically.  Note that we differentiate between a command
+     * "failure" and an "error" in the transport mechanism.
+     */
+    if (result == USB_STOR_TRANSPORT_FAILED) {
+        usb_stor_dbg(us, "-- transport indicates command failure\n");
+        need_auto_sense = 1;
+    }
+```
+&ensp;&ensp;&ensp;&ensp;里面的注释也是非常有趣的，先初始化need_auto_sense为0，然后分别对各种情况做判断：
+
+- 第一种情况是在CB传输时，设置need_auto_sense为1，注释部分已解释得很清楚了，目前先忽略掉该部分代码；
+- 另一种则是在传输FAILED时，设置need_auto_sense为1；
+
+###### 2.7.4.3.3 处理need_auto_sense前判断
+```C
+    /*
+     * Determine if this device is SAT by seeing if the
+     * command executed successfully.  Otherwise we'll have
+     * to wait for at least one CHECK_CONDITION to determine
+     * SANE_SENSE support
+     */
+    if (unlikely((srb->cmnd[0] == ATA_16 || srb->cmnd[0] == ATA_12) &&
+        result == USB_STOR_TRANSPORT_GOOD &&
+        !(us->fflags & US_FL_SANE_SENSE) &&
+        !(us->fflags & US_FL_BAD_SENSE) &&
+        !(srb->cmnd[2] & 0x20))) {
+        usb_stor_dbg(us, "-- SAT supported, increasing auto-sense\n");
+        us->fflags |= US_FL_SANE_SENSE;
+    }
+
+    /*
+     * A short transfer on a command where we don't expect it
+     * is unusual, but it doesn't mean we need to auto-sense.
+     */
+    if ((scsi_get_resid(srb) > 0) &&
+        !((srb->cmnd[0] == REQUEST_SENSE) ||
+          (srb->cmnd[0] == INQUIRY) || 
+          (srb->cmnd[0] == MODE_SENSE) ||
+          (srb->cmnd[0] == LOG_SENSE) ||
+          (srb->cmnd[0] == MODE_SENSE_10))) {
+        usb_stor_dbg(us, "-- unexpectedly short transfer\n");
+    }
+```
+
+- 如果device为SAT设备，且result为USB_STOR_TRANSPORT_GOOD，而us->fflags没有设置US_FL_SANE_SENSE和US_FL_BAD_SENSE等，设置us->fflags增加US_FL_SANE_SENSE标记（此处这个0x20尚未完全理解）；
+- 某些命令，返回short transfer结果时，即命令希望传输n个字节，结果device反馈回n-m各字节，但是对于以下五种命令来说，也无伤大雅，host暂时忍让，不需要auto-sense，继续代码；
+
+###### 2.7.4.3.4 sense data结构简介
+&ensp;&ensp;&ensp;&ensp;在讲解need_auto_sense情况之前，我们还是先简单学习一下SENSE DATA数据结构，该结构由SCSI手册定义，手册名：SCSI Primary Commands，当前最新为第5版，全称：spc5r18.pdf[^sample_4]
+
+&ensp;&ensp;&ensp;&ensp;spc5r18.pdf手册的4.4节详细介绍了sense data结构，分为两类：fixed format和descriptor format。两种结构存在共同元素，但是所在结构中的位置不一致，需要分别取出来进行处理。先贴出两个结构的格式图：
+
+- Descriptor format sense data
+![](images/descriptor_format_sense_data.png)
+
+- Fixed format sense data
+![](images/fixed_format_sense_data.png)
+
+&ensp;&ensp;&ensp;&ensp;内核里面用struct scsi_sense_hdr结构来对应sense data内通用元素，该结构定义如下：
+```C
+/*
+ * This is a slightly modified SCSI sense "descriptor" format header.
+ * The addition is to allow the 0x70 and 0x71 response codes. The idea
+ * is to place the salient data from either "fixed" or "descriptor" sense
+ * format into one structure to ease application processing.
+ *
+ * The original sense buffer should be kept around for those cases
+ * in which more information is required (e.g. the LBA of a MEDIUM ERROR).
+ */
+struct scsi_sense_hdr {     /* See SPC-3 section 4.5 */
+    u8 response_code;   /* permit: 0x0, 0x70, 0x71, 0x72, 0x73 */
+    u8 sense_key;
+    u8 asc;
+    u8 ascq;
+    u8 byte4;
+    u8 byte5;
+    u8 byte6;
+    u8 additional_length;   /* always 0 for fixed sense format */
+};
+```
+
+&ensp;&ensp;&ensp;&ensp;因为后续代码会用到sense_key、asc、ascq三个字段，分别对应手册中的SENSE KEY、ADDITIONAL SENSE CODE、ADDITIONAL SENSE CODE QUALIFIER字段，这三个字段提供了一个分层的信息，这个分层结构为应用程序客户端提供一个自顶向下的方法，以决定信息的报告状态。下面简单介绍下这三个元素的作用：
+
+- sense_key：标示描述报告状态的通用信息；
+- asc：标示sense_key字段的（描述报告状态的）附加信息，为可选字段；
+- ascq：标示asc字段中（描述报告状态信息的）的详细信息，为可选字段；
 
 
+###### 2.7.4.3.5 auto_sense处理
+&ensp;&ensp;&ensp;&ensp;判断了各类情况后，下面开始对need_auto_sense为1的情况进行处理；
+```C
+    /* Now, if we need to do the auto-sense, let's do it */
+    if (need_auto_sense) {
+        int temp_result;
+        struct scsi_eh_save ses;
+        int sense_size = US_SENSE_SIZE;
+        struct scsi_sense_hdr sshdr;
+        const u8 *scdd;
+        u8 fm_ili;
 
+        /* device supports and needs bigger sense buffer */
+        if (us->fflags & US_FL_SANE_SENSE)
+            sense_size = ~0;
+Retry_Sense:
+        usb_stor_dbg(us, "Issuing auto-REQUEST_SENSE\n");
 
+        scsi_eh_prep_cmnd(srb, &ses, NULL, 0, sense_size);
+
+        /* FIXME: we must do the protocol translation here */
+        if (us->subclass == USB_SC_RBC || us->subclass == USB_SC_SCSI ||
+                us->subclass == USB_SC_CYP_ATACB)
+            srb->cmd_len = 6;
+        else
+            srb->cmd_len = 12;
+
+        /* issue the auto-sense command */
+        scsi_set_resid(srb, 0);
+        temp_result = us->transport(us->srb, us);
+
+        /* let's clean up right away */
+        scsi_eh_restore_cmnd(srb, &ses);
+
+        if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
+            usb_stor_dbg(us, "-- auto-sense aborted\n");
+            srb->result = DID_ABORT << 16;
+
+            /* If SANE_SENSE caused this problem, disable it */
+            if (sense_size != US_SENSE_SIZE) {
+                us->fflags &= ~US_FL_SANE_SENSE;
+                us->fflags |= US_FL_BAD_SENSE;
+            }
+            goto Handle_Errors;
+        }
+
+        /*
+         * Some devices claim to support larger sense but fail when
+         * trying to request it. When a transport failure happens
+         * using US_FS_SANE_SENSE, we always retry with a standard
+         * (small) sense request. This fixes some USB GSM modems
+         */
+        if (temp_result == USB_STOR_TRANSPORT_FAILED &&
+                sense_size != US_SENSE_SIZE) {
+            usb_stor_dbg(us, "-- auto-sense failure, retry small sense\n");
+            sense_size = US_SENSE_SIZE;
+            us->fflags &= ~US_FL_SANE_SENSE;
+            us->fflags |= US_FL_BAD_SENSE;
+            goto Retry_Sense;
+        }
+
+        /* Other failures */
+        if (temp_result != USB_STOR_TRANSPORT_GOOD) {
+            usb_stor_dbg(us, "-- auto-sense failure\n");
+
+            /*
+             * we skip the reset if this happens to be a
+             * multi-target device, since failure of an
+             * auto-sense is perfectly valid
+             */
+            srb->result = DID_ERROR << 16;
+            if (!(us->fflags & US_FL_SCM_MULT_TARG))
+                goto Handle_Errors;
+            return;
+        }
+
+        /*
+         * If the sense data returned is larger than 18-bytes then we
+         * assume this device supports requesting more in the future.
+         * The response code must be 70h through 73h inclusive.
+         */
+        if (srb->sense_buffer[7] > (US_SENSE_SIZE - 8) &&
+            !(us->fflags & US_FL_SANE_SENSE) &&
+            !(us->fflags & US_FL_BAD_SENSE) &&
+            (srb->sense_buffer[0] & 0x7C) == 0x70) {
+            usb_stor_dbg(us, "-- SANE_SENSE support enabled\n");
+            us->fflags |= US_FL_SANE_SENSE;
+
+            /*
+             * Indicate to the user that we truncated their sense
+             * because we didn't know it supported larger sense.
+             */
+            usb_stor_dbg(us, "-- Sense data truncated to %i from %i\n",
+                     US_SENSE_SIZE,
+                     srb->sense_buffer[7] + 8);
+            srb->sense_buffer[7] = (US_SENSE_SIZE - 8);
+        }
+
+        scsi_normalize_sense(srb->sense_buffer, SCSI_SENSE_BUFFERSIZE,
+                     &sshdr);
+
+        usb_stor_dbg(us, "-- Result from auto-sense is %d\n",
+                 temp_result);
+        usb_stor_dbg(us, "-- code: 0x%x, key: 0x%x, ASC: 0x%x, ASCQ: 0x%x\n",
+                 sshdr.response_code, sshdr.sense_key,
+                 sshdr.asc, sshdr.ascq);
+#ifdef CONFIG_USB_STORAGE_DEBUG
+        usb_stor_show_sense(us, sshdr.sense_key, sshdr.asc, sshdr.ascq);
+#endif
+
+        /* set the result so the higher layers expect this data */
+        srb->result = SAM_STAT_CHECK_CONDITION;
+
+        scdd = scsi_sense_desc_find(srb->sense_buffer,
+                        SCSI_SENSE_BUFFERSIZE, 4);
+        fm_ili = (scdd ? scdd[3] : srb->sense_buffer[2]) & 0xA0;
+
+        /*
+         * We often get empty sense data.  This could indicate that
+         * everything worked or that there was an unspecified
+         * problem.  We have to decide which.
+         */
+        if (sshdr.sense_key == 0 && sshdr.asc == 0 && sshdr.ascq == 0 &&
+            fm_ili == 0) {
+            /*
+             * If things are really okay, then let's show that.
+             * Zero out the sense buffer so the higher layers
+             * won't realize we did an unsolicited auto-sense.
+             */
+            if (result == USB_STOR_TRANSPORT_GOOD) {
+                srb->result = SAM_STAT_GOOD;
+                srb->sense_buffer[0] = 0x0;
+            }
+
+            /*
+             * ATA-passthru commands use sense data to report
+             * the command completion status, and often devices
+             * return Check Condition status when nothing is
+             * wrong.
+             */
+            else if (srb->cmnd[0] == ATA_16 ||
+                    srb->cmnd[0] == ATA_12) {
+                /* leave the data alone */
+            }
+
+            /*
+             * If there was a problem, report an unspecified
+             * hardware error to prevent the higher layers from
+             * entering an infinite retry loop.
+             */
+            else {
+                srb->result = DID_ERROR << 16;
+                if ((sshdr.response_code & 0x72) == 0x72)
+                    srb->sense_buffer[1] = HARDWARE_ERROR;
+                else
+                    srb->sense_buffer[2] = HARDWARE_ERROR;
+            }
+        }
+    }
+```
+&ensp;&ensp;&ensp;&ensp;此处的主要工作就是发送REQUEST SENSE命令，这个逻辑和之前一样的，即再进行一次Bulk传输，还是三个阶段；现准备一个struct scsi_cmnd，调用us->transport(us->srb, us)，然后结束后检查结果。但是此处并没有再申请一个新的struct scsi_cmnd结构，而是沿用了之前的us->srb，只是在用之前调用scsi_eh_prep_cmnd()函数，将srb的一些关键信息保存在struct scsi_eh_save结构实例ses中，等调用完us->transport(us->srb, us)时候，再调用scsi_eh_restore_cmnd()恢复回来。
+
+&ensp;&ensp;&ensp;&ensp;中间还对USB_SC_RBC/USB_SC_SCSI/USB_SC_CYP_ATACB类设备做了限定，即对于该类设备，REQUEST SENSE长度只需要6字节，而其它的设备该命令长度为12字节。
+
+&ensp;&ensp;&ensp;&ensp;在分析temp_result结果时，先确认下us->dflags的US_FLIDX_TIMED_OUT标记，并且对存在US_FL_SANE_SENSE的情况进行了分析；即是否是因为Sane Sense大于18字节，才导致了此超时，如果是，那么就没必要继续分析了，直接跳到Handle_Errors流程。
+
+&ensp;&ensp;&ensp;&ensp;对于大于18字节的sense导致的failed的情况，如注释所说，驱动可以再重新发送一次标准的sense request命令，这能修复部分USB GSM模型；
+```C
+        /*
+         * Some devices claim to support larger sense but fail when
+         * trying to request it. When a transport failure happens
+         * using US_FS_SANE_SENSE, we always retry with a standard
+         * (small) sense request. This fixes some USB GSM modems
+         */
+        if (temp_result == USB_STOR_TRANSPORT_FAILED &&
+                sense_size != US_SENSE_SIZE) {
+            usb_stor_dbg(us, "-- auto-sense failure, retry small sense\n");
+            sense_size = US_SENSE_SIZE;
+            us->fflags &= ~US_FL_SANE_SENSE;
+            us->fflags |= US_FL_BAD_SENSE;
+            goto Retry_Sense;
+        }
+```
+
+&ensp;&ensp;&ensp;&ensp;对于其它错误的分析，即说明连REQUEST SENSE命令也failed了，于是设置srb->result = DID_ERROR << 16；此处需要做个进一步判断了，如果device没有设置US_FL_SCM_MULT_TARG标记，即没有多个target的话，那可以直接reset，但是如果是多个target的情况，则就不能这么简单的reset了。
+```C
+        /* Other failures */
+        if (temp_result != USB_STOR_TRANSPORT_GOOD) {
+            usb_stor_dbg(us, "-- auto-sense failure\n");
+
+            /*
+             * we skip the reset if this happens to be a
+             * multi-target device, since failure of an
+             * auto-sense is perfectly valid
+             */
+            srb->result = DID_ERROR << 16;
+            if (!(us->fflags & US_FL_SCM_MULT_TARG))
+                goto Handle_Errors;
+            return;
+        }
+```
+
+&ensp;&ensp;&ensp;&ensp;如果sense data大于18字节，则驱动认为在将来该device还需更大的sense data支持，即此处给它US_FL_SANE_SENSE标记。但是此次只能做截断sense data操作了，所以强迫将srb->sense_buffer[7] = (US_SENSE_SIZE - 8)，此处的减8操作，是因为sense_buffer[7]的值就是n - 7的来的，n为返回的数据。
+```C
+        /*
+         * If the sense data returned is larger than 18-bytes then we
+         * assume this device supports requesting more in the future.
+         * The response code must be 70h through 73h inclusive.
+         */
+        if (srb->sense_buffer[7] > (US_SENSE_SIZE - 8) &&
+            !(us->fflags & US_FL_SANE_SENSE) &&
+            !(us->fflags & US_FL_BAD_SENSE) &&
+            (srb->sense_buffer[0] & 0x7C) == 0x70) {
+            usb_stor_dbg(us, "-- SANE_SENSE support enabled\n");
+            us->fflags |= US_FL_SANE_SENSE;
+
+            /*
+             * Indicate to the user that we truncated their sense
+             * because we didn't know it supported larger sense.
+             */
+            usb_stor_dbg(us, "-- Sense data truncated to %i from %i\n",
+                     US_SENSE_SIZE,
+                     srb->sense_buffer[7] + 8);
+            srb->sense_buffer[7] = (US_SENSE_SIZE - 8);
+        }
+```
+
+&ensp;&ensp;&ensp;&ensp;scsi_normalize_sense()函数，即将srb->sense_buffer中通用sense data元素合成到sshdr变量中。代码实现如下：
+```C
+/**
+ * scsi_normalize_sense - normalize main elements from either fixed or
+ *          descriptor sense data format into a common format.
+ *          
+ * @sense_buffer:   byte array containing sense data returned by device
+ * @sb_len:     number of valid bytes in sense_buffer
+ * @sshdr:      pointer to instance of structure that common
+ *          elements are written to.
+ *
+ * Notes:
+ *  The "main elements" from sense data are: response_code, sense_key,
+ *  asc, ascq and additional_length (only for descriptor format).
+ *
+ *  Typically this function can be called after a device has
+ *  responded to a SCSI command with the CHECK_CONDITION status.
+ *                   
+ * Return value:
+ *  true if valid sense data information found, else false;
+ */
+bool scsi_normalize_sense(const u8 *sense_buffer, int sb_len,
+              struct scsi_sense_hdr *sshdr)
+{
+    memset(sshdr, 0, sizeof(struct scsi_sense_hdr));
+          
+    if (!sense_buffer || !sb_len)
+        return false;
+                 
+    sshdr->response_code = (sense_buffer[0] & 0x7f);
+        
+    if (!scsi_sense_valid(sshdr))
+        return false;
+  
+    if (sshdr->response_code >= 0x72) {
+        /*  
+         * descriptor format
+         */
+        if (sb_len > 1)
+            sshdr->sense_key = (sense_buffer[1] & 0xf);
+        if (sb_len > 2)
+            sshdr->asc = sense_buffer[2];
+        if (sb_len > 3)
+            sshdr->ascq = sense_buffer[3];
+        if (sb_len > 7)
+            sshdr->additional_length = sense_buffer[7];
+    } else {
+        /*  
+         * fixed format
+         */
+        if (sb_len > 2)
+            sshdr->sense_key = (sense_buffer[2] & 0xf);
+        if (sb_len > 7) {
+            sb_len = (sb_len < (sense_buffer[7] + 8)) ?
+                     sb_len : (sense_buffer[7] + 8);
+            if (sb_len > 12)
+                sshdr->asc = sense_buffer[12];
+            if (sb_len > 13)
+                sshdr->ascq = sense_buffer[13];
+        }
+    }
+
+    return true;
+}
+EXPORT_SYMBOL(scsi_normalize_sense);
+```
+
+&ensp;&ensp;&ensp;&ensp;接下来三条打印，可以根据这些信息来进行内核调试：
+```C
+        usb_stor_dbg(us, "-- Result from auto-sense is %d\n",
+                 temp_result);
+        usb_stor_dbg(us, "-- code: 0x%x, key: 0x%x, ASC: 0x%x, ASCQ: 0x%x\n",
+                 sshdr.response_code, sshdr.sense_key,
+                 sshdr.asc, sshdr.ascq);
+#ifdef CONFIG_USB_STORAGE_DEBUG
+        usb_stor_show_sense(us, sshdr.sense_key, sshdr.asc, sshdr.ascq);
+#endif
+```
+
+&ensp;&ensp;&ensp;&ensp;预先设置srb->result的状态；
+```C
+        /* set the result so the higher layers expect this data */
+        srb->result = SAM_STAT_CHECK_CONDITION;
+```
+
+&ensp;&ensp;&ensp;&ensp;获取sense data中的descriptor format sense data类型的sense data descriptor，此处scsi_sense_desc_find的参数赋值为4，参考手册得到是需要获取Stream commands类型的描述符（SCSI相关目前还未有过研究，此处就不深究了）；fm_ili这个变量的作用在此处的作用也未看懂，后续看懂了补上；
+```C
+        scdd = scsi_sense_desc_find(srb->sense_buffer,
+                        SCSI_SENSE_BUFFERSIZE, 4);
+        fm_ili = (scdd ? scdd[3] : srb->sense_buffer[2]) & 0xA0;
+```
+
+&ensp;&ensp;&ensp;&ensp;接下来是判断若拿到的是个空的sense data时，则判断各类情况：
+```C
+        /*
+         * We often get empty sense data.  This could indicate that
+         * everything worked or that there was an unspecified
+         * problem.  We have to decide which.
+         */
+        if (sshdr.sense_key == 0 && sshdr.asc == 0 && sshdr.ascq == 0 &&
+            fm_ili == 0) {
+            /*
+             * If things are really okay, then let's show that.
+             * Zero out the sense buffer so the higher layers
+             * won't realize we did an unsolicited auto-sense.
+             */
+            if (result == USB_STOR_TRANSPORT_GOOD) {
+                srb->result = SAM_STAT_GOOD;
+                srb->sense_buffer[0] = 0x0;
+            }
+
+            /*
+             * ATA-passthru commands use sense data to report
+             * the command completion status, and often devices
+             * return Check Condition status when nothing is
+             * wrong.
+             */
+            else if (srb->cmnd[0] == ATA_16 ||
+                    srb->cmnd[0] == ATA_12) {
+                /* leave the data alone */
+            }
+
+            /*
+             * If there was a problem, report an unspecified
+             * hardware error to prevent the higher layers from
+             * entering an infinite retry loop.
+             */
+            else {
+                srb->result = DID_ERROR << 16;
+                if ((sshdr.response_code & 0x72) == 0x72)
+                    srb->sense_buffer[1] = HARDWARE_ERROR;
+                else
+                    srb->sense_buffer[2] = HARDWARE_ERROR;
+            }
+        }
+```
+
+- 如果传输成功，即result == USB_STOR_TRANSPORT_GOOD，则判定此次传输结果为SAM_STAT_GOOD，且将sense_buffer赋值0，表示无需auto-sense；
+- 如果cmnd为ATA_16或者ATA_12，则继续；
+- 如果有问题，则将错误码写入sense_buffer中的sense_key字段，此处是分类为descriptor format和fixedformat两类sense data的情况；
+
+----
+&ensp;&ensp;&ensp;&ensp;如此，则need_auto_sense的情况处理结束，下面进入正常的结果处理及错误流程处理中；
+
+###### 2.7.4.3.6 （罕见）READ_10命令情况处理
+&ensp;&ensp;&ensp;&ensp;正如英文注释所说，某些device在处理READ(10)命令时，不能工作或返回错误data等；如果 US_FL_INITIAL_READ10标记也设置了，则保持跟踪以确保READ(10)命令成功。如果失败，则重试；
+```C
+    /*
+     * Some devices don't work or return incorrect data the first
+     * time they get a READ(10) command, or for the first READ(10)
+     * after a media change.  If the INITIAL_READ10 flag is set,
+     * keep track of whether READ(10) commands succeed.  If the
+     * previous one succeeded and this one failed, set the REDO_READ10
+     * flag to force a retry.
+     */
+    if (unlikely((us->fflags & US_FL_INITIAL_READ10) &&
+            srb->cmnd[0] == READ_10)) {
+        if (srb->result == SAM_STAT_GOOD) {
+            set_bit(US_FLIDX_READ10_WORKED, &us->dflags);
+        } else if (test_bit(US_FLIDX_READ10_WORKED, &us->dflags)) {
+            clear_bit(US_FLIDX_READ10_WORKED, &us->dflags);
+            set_bit(US_FLIDX_REDO_READ10, &us->dflags);
+        }
+
+        /*
+         * Next, if the REDO_READ10 flag is set, return a result
+         * code that will cause the SCSI core to retry the READ(10)
+         * command immediately.
+         */
+        if (test_bit(US_FLIDX_REDO_READ10, &us->dflags)) {
+            clear_bit(US_FLIDX_REDO_READ10, &us->dflags);
+            srb->result = DID_IMM_RETRY << 16;
+            srb->sense_buffer[0] = 0;
+        }
+    }
+```
+
+###### 2.7.4.3.7 返回前处理
+&ensp;&ensp;&ensp;&ensp;在函数返回前，做最后一次判断：
+```C
+    /* Did we transfer less than the minimum amount required? */
+    if ((srb->result == SAM_STAT_GOOD || srb->sense_buffer[2] == 0) &&
+            scsi_bufflen(srb) - scsi_get_resid(srb) < srb->underflow)
+        srb->result = DID_ERROR << 16;
+```
+&ensp;&ensp;&ensp;&ensp;确保传输的数据不小于最小需求，即srb->underflow；
+
+&ensp;&ensp;&ensp;&ensp;last_sector_hacks()判断last sector的情况，也是处理某些错误的流程；
+
+&ensp;&ensp;&ensp;&ensp;当检查错误完后，直接返回，即若没有出错的话，srb->result被赋值SAM_STAT_GOOD；
+
+###### 2.7.4.3.8 Error and abort processing
+&ensp;&ensp;&ensp;&ensp;如果出错的话，则使用port reset重新同步device，如果这也失败的话，则将device reset；即调用us->transport_reset来完成；
+```C
+    /*
+     * Error and abort processing: try to resynchronize with the device
+     * by issuing a port reset.  If that fails, try a class-specific
+     * device reset.
+     */
+  Handle_Errors:
+
+    /*
+     * Set the RESETTING bit, and clear the ABORTING bit so that
+     * the reset may proceed.
+     */
+    scsi_lock(us_to_host(us));
+    set_bit(US_FLIDX_RESETTING, &us->dflags);
+    clear_bit(US_FLIDX_ABORTING, &us->dflags);
+    scsi_unlock(us_to_host(us));
+
+    /*
+     * We must release the device lock because the pre_reset routine
+     * will want to acquire it.
+     */
+    mutex_unlock(&us->dev_mutex);
+    result = usb_stor_port_reset(us);
+    mutex_lock(&us->dev_mutex);
+
+    if (result < 0) {
+        scsi_lock(us_to_host(us));
+        usb_stor_report_device_reset(us);
+        scsi_unlock(us_to_host(us));
+        us->transport_reset(us);
+    }
+    clear_bit(US_FLIDX_RESETTING, &us->dflags);
+    last_sector_hacks(us, srb);
+```
+&ensp;&ensp;&ensp;&ensp;此部分当前限于了解一下，后续若真遇到此类BUG时，再继续深究。
+
+##### 2.7.4.4 usb_stor_control_thread()善后处理
+&ensp;&ensp;&ensp;&ensp;在处理完us->proto_handler(srb, us)之后，继续回到usb_stor_control_thread()中来，先设置dev忙状态：usb_mark_last_busy(us->pusb_dev)；
+
+&ensp;&ensp;&ensp;&ensp;善后工作如下：
+
+- 上锁处理srb相关，以及各标记位的检测；
+```C
+        /* lock access to the state */
+        scsi_lock(host);
+
+        /* was the command aborted? */
+        if (srb->result == DID_ABORT << 16) {
+SkipForAbort:
+            usb_stor_dbg(us, "scsi command aborted\n");
+            srb = NULL; /* Don't call srb->scsi_done() */
+        }
+
+        /*
+         * If an abort request was received we need to signal that
+         * the abort has finished.  The proper test for this is
+         * the TIMED_OUT flag, not srb->result == DID_ABORT, because
+         * the timeout might have occurred after the command had 
+         * already completed with a different result code.
+         */
+        if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
+            complete(&(us->notify));
+        
+            /* Allow USB transfers to resume */
+            clear_bit(US_FLIDX_ABORTING, &us->dflags);
+            clear_bit(US_FLIDX_TIMED_OUT, &us->dflags);
+        }
+
+        /* finished working on this command */
+        us->srb = NULL;
+        scsi_unlock(host);
+
+        /* unlock the device pointers */
+        mutex_unlock(&us->dev_mutex);
+```
+
+&ensp;&ensp;&ensp;&ensp;清空us->srb为NULL；通过srb->scsi_done通知SCSI core层srb已经处理完成；
+```C
+        /* now that the locks are released, notify the SCSI core */
+        if (srb) {
+            usb_stor_dbg(us, "scsi cmd done, result=0x%x\n",
+                    srb->result);
+            srb->scsi_done(srb);
+        }
+```
+
+---
+&ensp;&ensp;&ensp;&ensp;至此，USB storage的代码流程完成，其中还有很多部分未完成注释，虽然这些部分平时很难涉及；但是一般出现BUG时，其实几本都是些非常冷门的逻辑导致的出错；所以，后续希望还能够继续持续更新；
 
 
 
@@ -3805,3 +4494,4 @@ Value | Description
 [^sample_1]: 该段摘抄[蜗窝科技](http://www.wowotech.net/irq_subsystem/cmwq-intro.html)博客文章内某段内容。
 [^sample_2]: [USB_Storage_spec.md](https://github.com/TGSP/USB-storage-knowledge/blob/master/USB_Storage_spec.md)手册解析文档中的1.2.1.2小节。
 [^sample_3]:此处我也没看懂，是直接摘抄了《[Linux那些事儿之我是U盘](https://github.com/TGSP/USB-storage-knowledge/blob/master/Linux_stuff_am_I_a_USB_drive.pdf)》里面的，待后续学习SCSI架构了再来详细理解说明。
+[^sample_4]: SCSI手册可参考T10组织官网内发布的手册：http://www.t10.org
